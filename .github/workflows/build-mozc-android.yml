@@ -1,0 +1,145 @@
+name: Build Mozc for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      mozc_ref:
+        description: "Mozcのブランチ、タグ、またはコミットID"
+        required: true
+        default: "master"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android Mozc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Mozcソースを取得
+        uses: actions/checkout@v6
+        with:
+          repository: google/mozc
+          ref: ${{ inputs.mozc_ref }}
+          path: mozc
+          fetch-depth: 1
+
+      - name: Python 3.12を準備
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 基本ビルドツールを準備
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            curl \
+            file \
+            unzip \
+            zip
+
+          if ! command -v bazelisk >/dev/null 2>&1; then
+            curl -L \
+              -o /tmp/bazelisk \
+              https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+
+            chmod +x /tmp/bazelisk
+            sudo mv /tmp/bazelisk /usr/local/bin/bazelisk
+          fi
+
+          python3 --version
+          clang --version
+          bazelisk version
+
+      - name: Mozcの追加依存関係を取得
+        working-directory: mozc/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 build_tools/update_deps.py
+
+      - name: Android用libmozc.soをビルド
+        working-directory: mozc/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          bazelisk build \
+            package \
+            --config oss_android \
+            --config release_build
+
+          mkdir -p "$GITHUB_WORKSPACE/mozc-android-output"
+
+          cp -L \
+            bazel-bin/android/jni/native_libs.zip \
+            "$GITHUB_WORKSPACE/mozc-android-output/native_libs.zip"
+
+      - name: Mozc辞書データをビルド
+        working-directory: mozc/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          bazelisk build \
+            //data_manager/oss:mozc_dataset_for_oss \
+            --config release_build
+
+          cp -L \
+            bazel-bin/data_manager/oss/mozc.data \
+            "$GITHUB_WORKSPACE/mozc-android-output/mozc.data"
+
+      - name: バージョンとライセンスを保存
+        working-directory: mozc/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
+
+          {
+            echo "Mozc commit:"
+            git rev-parse HEAD
+            echo
+            echo "Build source:"
+            git log -1 --format="%H%n%cs%n%s"
+          } > "$OUTPUT/MOZC_BUILD_INFO.txt"
+
+          cp ../LICENSE "$OUTPUT/MOZC_LICENSE.txt"
+
+      - name: 成果物を検査
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/mozc-android-output"
+
+          test -s native_libs.zip
+          test -s mozc.data
+
+          unzip -t native_libs.zip
+          unzip -l native_libs.zip
+
+          sha256sum \
+            native_libs.zip \
+            mozc.data \
+            > SHA256SUMS.txt
+
+          ls -lh
+
+      - name: 成果物をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: mozc-android-${{ github.run_number }}
+          path: mozc-android-output/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
