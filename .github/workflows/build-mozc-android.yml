@@ -6,7 +6,7 @@ on:
       mozc_ref:
         description: "Mozcのブランチ、タグ、またはコミットID"
         required: true
-        default: "master"
+        default: "3f235b4eb6fcff7d14ef5f0fb8ee56de7ee4c732"
         type: string
 
 permissions:
@@ -47,7 +47,7 @@ jobs:
             zip
 
           if ! command -v bazelisk >/dev/null 2>&1; then
-            curl -L \
+            curl -fL \
               -o /tmp/bazelisk \
               https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
 
@@ -66,22 +66,35 @@ jobs:
           set -euxo pipefail
           python3 build_tools/update_deps.py
 
-      - name: Android用libmozc.soをビルド
+      - name: Zero Query入力データを確認
         working-directory: mozc/src
         shell: bash
         run: |
           set -euxo pipefail
 
-          bazelisk build \
-            package \
-            --config oss_android \
-            --config release_build
+          test -s data/zero_query/zero_query.def
+          test -s data/zero_query/zero_query_number.def
+          test -s data_manager/oss/BUILD.bazel
 
+          grep -n "zero_query_def" \
+            data_manager/oss/BUILD.bazel
+
+          grep -n "zero_query_number_def" \
+            data_manager/oss/BUILD.bazel
+
+          echo "zero_query.def:"
+          wc -l -c data/zero_query/zero_query.def
+
+          echo "zero_query_number.def:"
+          wc -l -c data/zero_query/zero_query_number.def
+
+          echo "Zero Query入力データを確認しました。"
+
+      - name: 出力フォルダを作成
+        shell: bash
+        run: |
+          set -euxo pipefail
           mkdir -p "$GITHUB_WORKSPACE/mozc-android-output"
-
-          cp -L \
-            bazel-bin/android/jni/native_libs.zip \
-            "$GITHUB_WORKSPACE/mozc-android-output/native_libs.zip"
 
       - name: Mozc辞書データをビルド
         working-directory: mozc/src
@@ -93,9 +106,63 @@ jobs:
             //data_manager/oss:mozc_dataset_for_oss \
             --config release_build
 
+          DATA_FILE="bazel-bin/data_manager/oss/mozc.data"
+
+          test -s "$DATA_FILE"
+
           cp -L \
-            bazel-bin/data_manager/oss/mozc.data \
+            "$DATA_FILE" \
             "$GITHUB_WORKSPACE/mozc-android-output/mozc.data"
+
+          file "$DATA_FILE"
+          ls -lh "$DATA_FILE"
+
+      - name: Android用libmozc.soをビルド
+        working-directory: mozc/src
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          bazelisk build \
+            package \
+            --config oss_android \
+            --config release_build
+
+          NATIVE_ZIP="bazel-bin/android/jni/native_libs.zip"
+
+          test -s "$NATIVE_ZIP"
+
+          cp -L \
+            "$NATIVE_ZIP" \
+            "$GITHUB_WORKSPACE/mozc-android-output/native_libs.zip"
+
+      - name: ネイティブライブラリを展開
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
+
+          mkdir -p "$OUTPUT/native_libs"
+          unzip -q \
+            "$OUTPUT/native_libs.zip" \
+            -d "$OUTPUT/native_libs"
+
+          find "$OUTPUT/native_libs" \
+            -type f \
+            -name "libmozc.so" \
+            -print \
+            -exec file {} \; \
+            -exec ls -lh {} \;
+
+          LIBRARY_COUNT="$(
+            find "$OUTPUT/native_libs" \
+              -type f \
+              -name "libmozc.so" \
+              | wc -l
+          )"
+
+          test "$LIBRARY_COUNT" -gt 0
 
       - name: バージョンとライセンスを保存
         working-directory: mozc/src
@@ -104,39 +171,75 @@ jobs:
           set -euxo pipefail
 
           OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
+          COMMIT_ID="$(git rev-parse HEAD)"
+          COMMIT_DATE="$(git log -1 --format='%cs')"
+          COMMIT_SUBJECT="$(git log -1 --format='%s')"
 
           {
+            echo "Mozc requested ref:"
+            echo "${{ inputs.mozc_ref }}"
+            echo
             echo "Mozc commit:"
-            git rev-parse HEAD
+            echo "$COMMIT_ID"
             echo
             echo "Build source:"
-            git log -1 --format="%H%n%cs%n%s"
+            echo "$COMMIT_ID"
+            echo "$COMMIT_DATE"
+            echo "$COMMIT_SUBJECT"
+            echo
+            echo "Dataset target:"
+            echo "//data_manager/oss:mozc_dataset_for_oss"
+            echo
+            echo "Zero Query source:"
+            echo "data/zero_query/zero_query.def"
+            echo "data/zero_query/zero_query_number.def"
           } > "$OUTPUT/MOZC_BUILD_INFO.txt"
 
-          cp ../LICENSE "$OUTPUT/MOZC_LICENSE.txt"
+          cp ../LICENSE \
+            "$OUTPUT/MOZC_LICENSE.txt"
+
+          cp data/zero_query/zero_query.def \
+            "$OUTPUT/zero_query.def"
+
+          cp data/zero_query/zero_query_number.def \
+            "$OUTPUT/zero_query_number.def"
 
       - name: 成果物を検査
         shell: bash
         run: |
           set -euxo pipefail
 
-          cd "$GITHUB_WORKSPACE/mozc-android-output"
+          OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
+          cd "$OUTPUT"
 
           test -s native_libs.zip
           test -s mozc.data
+          test -s zero_query.def
+          test -s zero_query_number.def
+          test -s MOZC_BUILD_INFO.txt
+          test -s MOZC_LICENSE.txt
 
           unzip -t native_libs.zip
-          unzip -l native_libs.zip
+
+          file mozc.data
+          ls -lh \
+            native_libs.zip \
+            mozc.data \
+            zero_query.def \
+            zero_query_number.def
 
           sha256sum \
             native_libs.zip \
             mozc.data \
+            zero_query.def \
+            zero_query_number.def \
             > SHA256SUMS.txt
 
-          ls -lh
+          cat MOZC_BUILD_INFO.txt
+          cat SHA256SUMS.txt
 
       - name: 成果物をアップロード
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mozc-android-${{ github.run_number }}
           path: mozc-android-output/
