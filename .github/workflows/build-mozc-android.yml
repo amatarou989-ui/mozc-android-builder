@@ -1,4 +1,4 @@
-name: Build Mozc for Android
+name: Build Mozc for Android with SudachiDict
 
 on:
   workflow_dispatch:
@@ -8,13 +8,18 @@ on:
         required: true
         default: "3f235b4eb6fcff7d14ef5f0fb8ee56de7ee4c732"
         type: string
+      sudachi_ref:
+        description: "mozcdic-ut-sudachidictのブランチ、タグ、またはコミットID"
+        required: true
+        default: "main"
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Android Mozc
+    name: Build Android Mozc with SudachiDict
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
@@ -25,6 +30,14 @@ jobs:
           repository: google/mozc
           ref: ${{ inputs.mozc_ref }}
           path: mozc
+          fetch-depth: 1
+
+      - name: Sudachi追加辞書を取得
+        uses: actions/checkout@v6
+        with:
+          repository: utuhiro78/mozcdic-ut-sudachidict
+          ref: ${{ inputs.sudachi_ref }}
+          path: mozcdic-ut-sudachidict
           fetch-depth: 1
 
       - name: Python 3.12を準備
@@ -40,6 +53,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            bzip2 \
             clang \
             curl \
             file \
@@ -65,6 +79,54 @@ jobs:
         run: |
           set -euxo pipefail
           python3 build_tools/update_deps.py
+
+      - name: Sudachi辞書をMozcへ追加
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ARCHIVE="$GITHUB_WORKSPACE/mozcdic-ut-sudachidict/mozcdic-ut-sudachidict.txt.bz2"
+          EXPANDED="$RUNNER_TEMP/mozcdic-ut-sudachidict.txt"
+          MOZC_DICTIONARY="$GITHUB_WORKSPACE/mozc/src/data/dictionary_oss/dictionary00.txt"
+
+          test -s "$ARCHIVE"
+          test -s "$MOZC_DICTIONARY"
+
+          bzip2 -dc "$ARCHIVE" > "$EXPANDED"
+          sed -i 's/\r$//' "$EXPANDED"
+          test -s "$EXPANDED"
+
+          awk -F '\t' '
+            NF == 0 { next }
+            NF != 5 {
+              invalid += 1
+              if (invalid <= 10) {
+                print "不正な辞書行 " NR ": " $0 > "/dev/stderr"
+              }
+            }
+            END {
+              print "Sudachi dictionary entries: " NR
+              print "Invalid entries: " invalid
+              exit invalid > 0
+            }
+          ' "$EXPANDED"
+
+          BEFORE_LINES="$(wc -l < "$MOZC_DICTIONARY")"
+          ADDED_LINES="$(wc -l < "$EXPANDED")"
+
+          cat "$EXPANDED" >> "$MOZC_DICTIONARY"
+
+          AFTER_LINES="$(wc -l < "$MOZC_DICTIONARY")"
+          test "$AFTER_LINES" -gt "$BEFORE_LINES"
+
+          echo "Mozc dictionary before: $BEFORE_LINES"
+          echo "Sudachi dictionary added: $ADDED_LINES"
+          echo "Mozc dictionary after: $AFTER_LINES"
+
+          echo "=== 代表語彙の収録確認（見つからなくてもビルドは継続） ==="
+          grep -F -m 5 "鬼滅の刃" "$EXPANDED" || true
+          grep -F -m 5 "ぼっち・ざ・ろっく" "$EXPANDED" || true
+          grep -F -m 5 "推しの子" "$EXPANDED" || true
 
       - name: Zero Query入力データを確認
         working-directory: mozc/src
@@ -171,21 +233,42 @@ jobs:
           set -euxo pipefail
 
           OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
-          COMMIT_ID="$(git rev-parse HEAD)"
-          COMMIT_DATE="$(git log -1 --format='%cs')"
-          COMMIT_SUBJECT="$(git log -1 --format='%s')"
+          MOZC_COMMIT_ID="$(git rev-parse HEAD)"
+          MOZC_COMMIT_DATE="$(git log -1 --format='%cs')"
+          MOZC_COMMIT_SUBJECT="$(git log -1 --format='%s')"
+          SUDACHI_REPOSITORY="$GITHUB_WORKSPACE/mozcdic-ut-sudachidict"
+          SUDACHI_COMMIT_ID="$(git -C "$SUDACHI_REPOSITORY" rev-parse HEAD)"
+          SUDACHI_COMMIT_DATE="$(git -C "$SUDACHI_REPOSITORY" log -1 --format='%cs')"
+          SUDACHI_COMMIT_SUBJECT="$(git -C "$SUDACHI_REPOSITORY" log -1 --format='%s')"
 
           {
             echo "Mozc requested ref:"
             echo "${{ inputs.mozc_ref }}"
             echo
             echo "Mozc commit:"
-            echo "$COMMIT_ID"
+            echo "$MOZC_COMMIT_ID"
             echo
-            echo "Build source:"
-            echo "$COMMIT_ID"
-            echo "$COMMIT_DATE"
-            echo "$COMMIT_SUBJECT"
+            echo "Mozc build source:"
+            echo "$MOZC_COMMIT_ID"
+            echo "$MOZC_COMMIT_DATE"
+            echo "$MOZC_COMMIT_SUBJECT"
+            echo
+            echo "Sudachi dictionary requested ref:"
+            echo "${{ inputs.sudachi_ref }}"
+            echo
+            echo "Sudachi dictionary commit:"
+            echo "$SUDACHI_COMMIT_ID"
+            echo
+            echo "Sudachi dictionary source:"
+            echo "$SUDACHI_COMMIT_ID"
+            echo "$SUDACHI_COMMIT_DATE"
+            echo "$SUDACHI_COMMIT_SUBJECT"
+            echo
+            echo "Sudachi dictionary repository:"
+            echo "utuhiro78/mozcdic-ut-sudachidict"
+            echo
+            echo "Sudachi dictionary license:"
+            echo "Apache License 2.0"
             echo
             echo "Dataset target:"
             echo "//data_manager/oss:mozc_dataset_for_oss"
@@ -197,6 +280,9 @@ jobs:
 
           cp ../LICENSE \
             "$OUTPUT/MOZC_LICENSE.txt"
+
+          cp "$SUDACHI_REPOSITORY/LICENSE" \
+            "$OUTPUT/SUDACHI_DICTIONARY_LICENSE.txt"
 
           cp data/zero_query/zero_query.def \
             "$OUTPUT/zero_query.def"
@@ -218,6 +304,7 @@ jobs:
           test -s zero_query_number.def
           test -s MOZC_BUILD_INFO.txt
           test -s MOZC_LICENSE.txt
+          test -s SUDACHI_DICTIONARY_LICENSE.txt
 
           unzip -t native_libs.zip
 
@@ -233,6 +320,9 @@ jobs:
             mozc.data \
             zero_query.def \
             zero_query_number.def \
+            MOZC_BUILD_INFO.txt \
+            MOZC_LICENSE.txt \
+            SUDACHI_DICTIONARY_LICENSE.txt \
             > SHA256SUMS.txt
 
           cat MOZC_BUILD_INFO.txt
@@ -241,7 +331,7 @@ jobs:
       - name: 成果物をアップロード
         uses: actions/upload-artifact@v7
         with:
-          name: mozc-android-${{ github.run_number }}
+          name: mozc-android-sudachi-${{ github.run_number }}
           path: mozc-android-output/
           if-no-files-found: error
           retention-days: 30
