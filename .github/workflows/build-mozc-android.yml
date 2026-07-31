@@ -1,4 +1,4 @@
-name: Build Mozc for Android with SudachiDict
+name: Build Mozc for Android with corrected SudachiDict
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
       sudachi_ref:
         description: "mozcdic-ut-sudachidictのブランチ、タグ、またはコミットID"
         required: true
-        default: "main"
+        default: "c686771bada1d59e9b105c81b29e6ac1a239cb54"
         type: string
 
 permissions:
@@ -19,11 +19,17 @@ permissions:
 
 jobs:
   build:
-    name: Build Android Mozc with SudachiDict
+    name: Build Android Mozc with corrected SudachiDict
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
     steps:
+      - name: Builder本体を取得
+        uses: actions/checkout@v6
+        with:
+          path: builder
+          fetch-depth: 1
+
       - name: Mozcソースを取得
         uses: actions/checkout@v6
         with:
@@ -86,29 +92,56 @@ jobs:
           set -euxo pipefail
           mkdir -p "$GITHUB_WORKSPACE/mozc-android-output"
 
-      - name: 辞書を展開・診断・ピンポイント修正
+      - name: Sudachi補正スクリプトの状態判定テスト
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 "$GITHUB_WORKSPACE/builder/tools/test_patch_sudachi_dictionary.py"
+
+      - name: Sudachi辞書へ確認済み補正を適用
         shell: bash
         run: |
           set -euxo pipefail
 
           OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
           ARCHIVE="$GITHUB_WORKSPACE/mozcdic-ut-sudachidict/mozcdic-ut-sudachidict.txt.bz2"
-          EXPANDED="$RUNNER_TEMP/mozcdic-ut-sudachidict.txt"
+          ORIGINAL="$RUNNER_TEMP/mozcdic-ut-sudachidict-original.txt"
+          CORRECTED="$RUNNER_TEMP/mozcdic-ut-sudachidict-corrected.txt"
+          RULES="$GITHUB_WORKSPACE/builder/data/sudachi_dictionary_corrections.tsv"
+          PATCHER="$GITHUB_WORKSPACE/builder/tools/patch_sudachi_dictionary.py"
+          REPORT="$OUTPUT/SUDACHI_CORRECTION_REPORT.tsv"
+          SUMMARY="$OUTPUT/SUDACHI_CORRECTION_SUMMARY.txt"
           MOZC_DICTIONARY="$GITHUB_WORKSPACE/mozc/src/data/dictionary_oss/dictionary00.txt"
 
-          BAD_READING="あべしんぞうないかく"
-          CORRECT_READING="あべないかく"
-          TARGET_VALUE="安倍内閣"
-
           test -s "$ARCHIVE"
+          test -s "$RULES"
+          test -s "$PATCHER"
           test -s "$MOZC_DICTIONARY"
 
-          bzip2 -dc "$ARCHIVE" > "$EXPANDED"
-          sed -i 's/\r$//' "$EXPANDED"
-          test -s "$EXPANDED"
+          bzip2 -dc "$ARCHIVE" > "$ORIGINAL"
+          sed -i 's/\r$//' "$ORIGINAL"
+          test -s "$ORIGINAL"
+
+          # 補正判定で停止した場合も、元辞書・ルール・診断結果をArtifactsへ残す。
+          cp "$RULES" "$OUTPUT/sudachi_dictionary_corrections.tsv"
+          bzip2 -c "$ORIGINAL" \
+            > "$OUTPUT/mozcdic-ut-sudachidict-original.txt.bz2"
+          bzip2 -c "$MOZC_DICTIONARY" \
+            > "$OUTPUT/dictionary00-original.txt.bz2"
+
+          python3 "$PATCHER" \
+            --input "$ORIGINAL" \
+            --rules "$RULES" \
+            --output "$CORRECTED" \
+            --report "$REPORT" \
+            --summary "$SUMMARY"
+
+          test -s "$CORRECTED"
+          test -s "$REPORT"
+          test -s "$SUMMARY"
+          grep -Fx "result=SUCCESS" "$SUMMARY"
 
           awk -F '\t' '
-            NF == 0 { next }
             NF != 5 {
               invalid += 1
               if (invalid <= 10) {
@@ -116,228 +149,44 @@ jobs:
               }
             }
             END {
-              print "Sudachi dictionary entries: " NR
+              print "Corrected Sudachi dictionary entries: " NR
               print "Invalid entries: " (invalid + 0)
               exit invalid > 0
             }
-          ' "$EXPANDED"
+          ' "$CORRECTED"
 
-          # 調査用に、加工前の辞書本体を成果物へ保存する。
+          bzip2 -c "$CORRECTED" \
+            > "$OUTPUT/mozcdic-ut-sudachidict-corrected.txt.bz2"
+
+          BEFORE_LINES="$(wc -l < "$MOZC_DICTIONARY")"
+          ADDED_LINES="$(wc -l < "$CORRECTED")"
+
+          cat "$CORRECTED" >> "$MOZC_DICTIONARY"
+
+          AFTER_LINES="$(wc -l < "$MOZC_DICTIONARY")"
+          test "$AFTER_LINES" -eq "$((BEFORE_LINES + ADDED_LINES))"
+
           bzip2 -c "$MOZC_DICTIONARY" \
-            > "$OUTPUT/dictionary00-original.txt.bz2"
+            > "$OUTPUT/dictionary00-merged-corrected.txt.bz2"
 
-          bzip2 -c "$EXPANDED" \
-            > "$OUTPUT/mozcdic-ut-sudachidict-original.txt.bz2"
+          echo "Mozc dictionary before merge: $BEFORE_LINES"
+          echo "Corrected Sudachi dictionary added: $ADDED_LINES"
+          echo "Mozc dictionary after merge: $AFTER_LINES"
 
-          MOZC_BAD_COUNT="$(
-            awk -F '\t' \
-              -v reading="$BAD_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == reading && $5 == value { count += 1 }
-               END { print count + 0 }' \
-              "$MOZC_DICTIONARY"
-          )"
-
-          SUDACHI_BAD_COUNT="$(
-            awk -F '\t' \
-              -v reading="$BAD_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == reading && $5 == value { count += 1 }
-               END { print count + 0 }' \
-              "$EXPANDED"
-          )"
-
-          TOTAL_BAD_COUNT="$((MOZC_BAD_COUNT + SUDACHI_BAD_COUNT))"
-
-          {
-            echo "=== 安倍内閣の辞書診断（修正前） ==="
-            echo
-            echo "誤読:"
-            echo "$BAD_READING"
-            echo
-            echo "正しい読み:"
-            echo "$CORRECT_READING"
-            echo
-            echo "表記:"
-            echo "$TARGET_VALUE"
-            echo
-            echo "Mozc標準辞書の完全一致件数:"
-            echo "$MOZC_BAD_COUNT"
-            echo
-            echo "Sudachi追加辞書の完全一致件数:"
-            echo "$SUDACHI_BAD_COUNT"
-            echo
-            echo "合計:"
-            echo "$TOTAL_BAD_COUNT"
-            echo
-            echo "=== Mozc標準辞書の関連行 ==="
-            awk -F '\t' \
-              -v bad="$BAD_READING" \
-              -v correct="$CORRECT_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == bad || $1 == correct || $5 == value {
-                 print NR ":" $0
-               }' \
-              "$MOZC_DICTIONARY" || true
-            echo
-            echo "=== Sudachi追加辞書の関連行 ==="
-            awk -F '\t' \
-              -v bad="$BAD_READING" \
-              -v correct="$CORRECT_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == bad || $1 == correct || $5 == value {
-                 print NR ":" $0
-               }' \
-              "$EXPANDED" || true
-            echo
-            echo "=== 安倍晋三・内閣の構成候補（先頭50件） ==="
-            awk -F '\t' '
-              ($1 == "あべしんぞう" && $5 == "安倍晋三") ||
-              ($1 == "ないかく" && $5 == "内閣") ||
-              ($1 == "あべしんぞうないかく" && $5 == "安倍晋三内閣") {
-                print FILENAME ":" NR ":" $0
-                shown += 1
-                if (shown >= 50) {
-                  exit
-                }
-              }
-            ' "$MOZC_DICTIONARY" "$EXPANDED" || true
-          } | tee "$OUTPUT/ABE_DICTIONARY_DIAGNOSTIC_BEFORE.txt"
-
-          # 該当行が見つからない場合は、別の生成経路が原因なので、
-          # 根拠なく辞書行を追加せず、診断成果物を残して停止する。
-          if [ "$TOTAL_BAD_COUNT" -eq 0 ]; then
-            echo "::error::誤読レコードがテキスト辞書内に見つかりませんでした。"
-            echo "::error::ABE_DICTIONARY_DIAGNOSTIC_BEFORE.txt と元辞書を確認してください。"
+          echo "=== 重要補正結果 ==="
+          grep -F $'あべないかく\t' "$CORRECTED" | grep -F $'\t安倍内閣' || true
+          if grep -F $'あべしんぞうないかく\t' "$CORRECTED" | grep -Fq $'\t安倍内閣'; then
+            echo "::error::安倍内閣の誤読が残っています"
             exit 1
           fi
 
-          patch_dictionary() {
-            local source_file="$1"
-            local temporary_file="$2"
+          grep -F $'いわてけんりつはなまきみなみこうとうがっこう\t' "$CORRECTED" \
+            | grep -F $'\t岩手県立花巻南高等学校'
+          grep -F $'じょうほうじゃくしゃむけびじねす\t' "$CORRECTED" \
+            | grep -F $'\t情報弱者向けビジネス'
 
-            awk -F '\t' \
-              -v OFS='\t' \
-              -v bad="$BAD_READING" \
-              -v correct="$CORRECT_READING" \
-              -v value="$TARGET_VALUE" '
-                $1 == bad && $5 == value {
-                  $1 = correct
-                  corrected += 1
-                }
-                {
-                  print
-                }
-                END {
-                  print "Corrected entries: " (corrected + 0) > "/dev/stderr"
-                }
-              ' "$source_file" > "$temporary_file"
-
-            test -s "$temporary_file"
-            mv "$temporary_file" "$source_file"
-          }
-
-          patch_dictionary \
-            "$MOZC_DICTIONARY" \
-            "$RUNNER_TEMP/dictionary00-patched.txt"
-
-          patch_dictionary \
-            "$EXPANDED" \
-            "$RUNNER_TEMP/mozcdic-ut-sudachidict-patched.txt"
-
-          REMAINING_MOZC_BAD="$(
-            awk -F '\t' \
-              -v reading="$BAD_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == reading && $5 == value { count += 1 }
-               END { print count + 0 }' \
-              "$MOZC_DICTIONARY"
-          )"
-
-          REMAINING_SUDACHI_BAD="$(
-            awk -F '\t' \
-              -v reading="$BAD_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == reading && $5 == value { count += 1 }
-               END { print count + 0 }' \
-              "$EXPANDED"
-          )"
-
-          test "$REMAINING_MOZC_BAD" -eq 0
-          test "$REMAINING_SUDACHI_BAD" -eq 0
-
-          CORRECTED_MOZC_COUNT="$(
-            awk -F '\t' \
-              -v reading="$CORRECT_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == reading && $5 == value { count += 1 }
-               END { print count + 0 }' \
-              "$MOZC_DICTIONARY"
-          )"
-
-          CORRECTED_SUDACHI_COUNT="$(
-            awk -F '\t' \
-              -v reading="$CORRECT_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == reading && $5 == value { count += 1 }
-               END { print count + 0 }' \
-              "$EXPANDED"
-          )"
-
-          {
-            echo "=== 安倍内閣の辞書診断（修正後） ==="
-            echo
-            echo "Mozc標準辞書に残る誤読件数:"
-            echo "$REMAINING_MOZC_BAD"
-            echo
-            echo "Sudachi追加辞書に残る誤読件数:"
-            echo "$REMAINING_SUDACHI_BAD"
-            echo
-            echo "Mozc標準辞書の正しい読み件数:"
-            echo "$CORRECTED_MOZC_COUNT"
-            echo
-            echo "Sudachi追加辞書の正しい読み件数:"
-            echo "$CORRECTED_SUDACHI_COUNT"
-            echo
-            echo "=== Mozc標準辞書の修正後関連行 ==="
-            awk -F '\t' \
-              -v reading="$CORRECT_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == reading && $5 == value {
-                 print NR ":" $0
-               }' \
-              "$MOZC_DICTIONARY" || true
-            echo
-            echo "=== Sudachi追加辞書の修正後関連行 ==="
-            awk -F '\t' \
-              -v reading="$CORRECT_READING" \
-              -v value="$TARGET_VALUE" \
-              '$1 == reading && $5 == value {
-                 print NR ":" $0
-               }' \
-              "$EXPANDED" || true
-          } | tee "$OUTPUT/ABE_DICTIONARY_DIAGNOSTIC_AFTER.txt"
-
-          BEFORE_LINES="$(wc -l < "$MOZC_DICTIONARY")"
-          ADDED_LINES="$(wc -l < "$EXPANDED")"
-
-          cat "$EXPANDED" >> "$MOZC_DICTIONARY"
-
-          AFTER_LINES="$(wc -l < "$MOZC_DICTIONARY")"
-          test "$AFTER_LINES" -gt "$BEFORE_LINES"
-
-          # 実際にmozc.dataへ渡す、修正・結合後の辞書も保存する。
-          bzip2 -c "$MOZC_DICTIONARY" \
-            > "$OUTPUT/dictionary00-merged-patched.txt.bz2"
-
-          echo "Mozc dictionary before merge: $BEFORE_LINES"
-          echo "Sudachi dictionary added: $ADDED_LINES"
-          echo "Mozc dictionary after merge: $AFTER_LINES"
-
-          echo "=== 代表語彙の収録確認（見つからなくてもビルドは継続） ==="
-          grep -F -m 5 "鬼滅の刃" "$EXPANDED" || true
-          grep -F -m 5 "ぼっち・ざ・ろっく" "$EXPANDED" || true
-          grep -F -m 5 "推しの子" "$EXPANDED" || true
+          cat "$SUMMARY"
+          cat "$REPORT"
 
       - name: Zero Query入力データを確認
         working-directory: mozc/src
@@ -349,19 +198,11 @@ jobs:
           test -s data/zero_query/zero_query_number.def
           test -s data_manager/oss/BUILD.bazel
 
-          grep -n "zero_query_def" \
-            data_manager/oss/BUILD.bazel
+          grep -n "zero_query_def" data_manager/oss/BUILD.bazel
+          grep -n "zero_query_number_def" data_manager/oss/BUILD.bazel
 
-          grep -n "zero_query_number_def" \
-            data_manager/oss/BUILD.bazel
-
-          echo "zero_query.def:"
           wc -l -c data/zero_query/zero_query.def
-
-          echo "zero_query_number.def:"
           wc -l -c data/zero_query/zero_query_number.def
-
-          echo "Zero Query入力データを確認しました。"
 
       - name: Mozc辞書データをビルド
         working-directory: mozc/src
@@ -374,7 +215,6 @@ jobs:
             --config release_build
 
           DATA_FILE="bazel-bin/data_manager/oss/mozc.data"
-
           test -s "$DATA_FILE"
 
           cp -L \
@@ -396,7 +236,6 @@ jobs:
             --config release_build
 
           NATIVE_ZIP="bazel-bin/android/jni/native_libs.zip"
-
           test -s "$NATIVE_ZIP"
 
           cp -L \
@@ -411,9 +250,15 @@ jobs:
           OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
 
           mkdir -p "$OUTPUT/native_libs"
-          unzip -q \
-            "$OUTPUT/native_libs.zip" \
-            -d "$OUTPUT/native_libs"
+          unzip -q "$OUTPUT/native_libs.zip" -d "$OUTPUT/native_libs"
+
+          LIBRARY_COUNT="$(
+            find "$OUTPUT/native_libs" \
+              -type f \
+              -name "libmozc.so" \
+              | wc -l
+          )"
+          test "$LIBRARY_COUNT" -gt 0
 
           find "$OUTPUT/native_libs" \
             -type f \
@@ -422,16 +267,7 @@ jobs:
             -exec file {} \; \
             -exec ls -lh {} \;
 
-          LIBRARY_COUNT="$(
-            find "$OUTPUT/native_libs" \
-              -type f \
-              -name "libmozc.so" \
-              | wc -l
-          )"
-
-          test "$LIBRARY_COUNT" -gt 0
-
-      - name: バージョンとライセンスを保存
+      - name: バージョン・補正情報・ライセンスを保存
         working-directory: mozc/src
         shell: bash
         run: |
@@ -445,15 +281,16 @@ jobs:
           SUDACHI_COMMIT_ID="$(git -C "$SUDACHI_REPOSITORY" rev-parse HEAD)"
           SUDACHI_COMMIT_DATE="$(git -C "$SUDACHI_REPOSITORY" log -1 --format='%cs')"
           SUDACHI_COMMIT_SUBJECT="$(git -C "$SUDACHI_REPOSITORY" log -1 --format='%s')"
+          RULE_SHA256="$(
+            sha256sum "$GITHUB_WORKSPACE/builder/data/sudachi_dictionary_corrections.tsv" \
+              | awk '{print $1}'
+          )"
 
           {
             echo "Mozc requested ref:"
             echo "${{ inputs.mozc_ref }}"
             echo
             echo "Mozc commit:"
-            echo "$MOZC_COMMIT_ID"
-            echo
-            echo "Mozc build source:"
             echo "$MOZC_COMMIT_ID"
             echo "$MOZC_COMMIT_DATE"
             echo "$MOZC_COMMIT_SUBJECT"
@@ -463,11 +300,16 @@ jobs:
             echo
             echo "Sudachi dictionary commit:"
             echo "$SUDACHI_COMMIT_ID"
-            echo
-            echo "Sudachi dictionary source:"
-            echo "$SUDACHI_COMMIT_ID"
             echo "$SUDACHI_COMMIT_DATE"
             echo "$SUDACHI_COMMIT_SUBJECT"
+            echo
+            echo "Sudachi correction rules SHA-256:"
+            echo "$RULE_SHA256"
+            echo
+            echo "Sudachi correction summary:"
+            cat "$OUTPUT/SUDACHI_CORRECTION_SUMMARY.txt"
+            echo "岩手県立花巻南高等学校は完全読み1件だけを維持"
+            echo "情報弱者向けビジネスは完全読み1件だけを維持"
             echo
             echo "Sudachi dictionary repository:"
             echo "utuhiro78/mozcdic-ut-sudachidict"
@@ -477,24 +319,12 @@ jobs:
             echo
             echo "Dataset target:"
             echo "//data_manager/oss:mozc_dataset_for_oss"
-            echo
-            echo "Zero Query source:"
-            echo "data/zero_query/zero_query.def"
-            echo "data/zero_query/zero_query_number.def"
-            echo
-            echo "Dictionary pinpoint correction:"
-            echo "安倍内閣: あべしんぞうないかく -> あべないかく"
           } > "$OUTPUT/MOZC_BUILD_INFO.txt"
 
-          cp ../LICENSE \
-            "$OUTPUT/MOZC_LICENSE.txt"
-
+          cp ../LICENSE "$OUTPUT/MOZC_LICENSE.txt"
           cp "$SUDACHI_REPOSITORY/LICENSE" \
             "$OUTPUT/SUDACHI_DICTIONARY_LICENSE.txt"
-
-          cp data/zero_query/zero_query.def \
-            "$OUTPUT/zero_query.def"
-
+          cp data/zero_query/zero_query.def "$OUTPUT/zero_query.def"
           cp data/zero_query/zero_query_number.def \
             "$OUTPUT/zero_query_number.def"
 
@@ -513,23 +343,16 @@ jobs:
           test -s MOZC_BUILD_INFO.txt
           test -s MOZC_LICENSE.txt
           test -s SUDACHI_DICTIONARY_LICENSE.txt
-          test -s ABE_DICTIONARY_DIAGNOSTIC_BEFORE.txt
-          test -s ABE_DICTIONARY_DIAGNOSTIC_AFTER.txt
+          test -s SUDACHI_CORRECTION_REPORT.tsv
+          test -s SUDACHI_CORRECTION_SUMMARY.txt
+          test -s sudachi_dictionary_corrections.tsv
           test -s dictionary00-original.txt.bz2
           test -s mozcdic-ut-sudachidict-original.txt.bz2
-          test -s dictionary00-merged-patched.txt.bz2
+          test -s mozcdic-ut-sudachidict-corrected.txt.bz2
+          test -s dictionary00-merged-corrected.txt.bz2
 
           unzip -t native_libs.zip
-
           file mozc.data
-          ls -lh \
-            native_libs.zip \
-            mozc.data \
-            zero_query.def \
-            zero_query_number.def \
-            dictionary00-original.txt.bz2 \
-            mozcdic-ut-sudachidict-original.txt.bz2 \
-            dictionary00-merged-patched.txt.bz2
 
           sha256sum \
             native_libs.zip \
@@ -539,23 +362,25 @@ jobs:
             MOZC_BUILD_INFO.txt \
             MOZC_LICENSE.txt \
             SUDACHI_DICTIONARY_LICENSE.txt \
-            ABE_DICTIONARY_DIAGNOSTIC_BEFORE.txt \
-            ABE_DICTIONARY_DIAGNOSTIC_AFTER.txt \
+            SUDACHI_CORRECTION_REPORT.tsv \
+            SUDACHI_CORRECTION_SUMMARY.txt \
+            sudachi_dictionary_corrections.tsv \
             dictionary00-original.txt.bz2 \
             mozcdic-ut-sudachidict-original.txt.bz2 \
-            dictionary00-merged-patched.txt.bz2 \
+            mozcdic-ut-sudachidict-corrected.txt.bz2 \
+            dictionary00-merged-corrected.txt.bz2 \
             > SHA256SUMS.txt
 
           cat MOZC_BUILD_INFO.txt
-          cat ABE_DICTIONARY_DIAGNOSTIC_BEFORE.txt
-          cat ABE_DICTIONARY_DIAGNOSTIC_AFTER.txt
+          cat SUDACHI_CORRECTION_SUMMARY.txt
+          cat SUDACHI_CORRECTION_REPORT.tsv
           cat SHA256SUMS.txt
 
       - name: 成果物または診断ファイルをアップロード
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: mozc-android-sudachi-abe-fix-${{ github.run_number }}
+          name: mozc-android-sudachi-corrected-${{ github.run_number }}
           path: mozc-android-output/
           if-no-files-found: error
           retention-days: 30
