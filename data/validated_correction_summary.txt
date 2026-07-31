@@ -1,0 +1,10 @@
+result=SUCCESS
+input_lines=1284866
+output_lines=1284815
+rules=53
+applied=53
+already_fixed=0
+not_present=0
+unexpected=0
+removed=82
+added=31
