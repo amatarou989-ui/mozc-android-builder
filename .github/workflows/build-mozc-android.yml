@@ -92,11 +92,13 @@ jobs:
           set -euxo pipefail
           mkdir -p "$GITHUB_WORKSPACE/mozc-android-output"
 
-      - name: Sudachi補正スクリプトの状態判定テスト
+      - name: Sudachi補正・word cost生成スクリプトをテスト
         shell: bash
         run: |
           set -euxo pipefail
           python3 "$GITHUB_WORKSPACE/builder/tools/test_patch_sudachi_dictionary.py"
+          PYTHONPATH="$GITHUB_WORKSPACE/builder/tools" \
+            python3 -m unittest -v test_build_sudachi_word_cost
 
       - name: Sudachi辞書へ確認済み補正を適用
         shell: bash
@@ -157,6 +159,21 @@ jobs:
 
           bzip2 -c "$CORRECTED" \
             > "$OUTPUT/mozcdic-ut-sudachidict-corrected.txt.bz2"
+
+          # 補正済みSudachi辞書の reading + surface + cost を、Androidで直接二分探索できる
+          # 専用バイナリへ変換する。Mozcへ結合する前のSudachi由来行だけを対象にする。
+          SUDACHI_COMMIT_ID="$(git -C "$GITHUB_WORKSPACE/mozcdic-ut-sudachidict" rev-parse HEAD)"
+          python3 "$GITHUB_WORKSPACE/builder/tools/build_sudachi_word_cost.py" \
+            --input "$CORRECTED" \
+            --output-bin "$OUTPUT/sudachi_word_cost_v1.bin" \
+            --output-tsv "$OUTPUT/sudachi_word_cost_v1.tsv" \
+            --manifest "$OUTPUT/SUDACHI_WORD_COST_MANIFEST.json" \
+            --source-ref "${{ inputs.sudachi_ref }}" \
+            --source-commit "$SUDACHI_COMMIT_ID"
+
+          test -s "$OUTPUT/sudachi_word_cost_v1.bin"
+          test -s "$OUTPUT/sudachi_word_cost_v1.tsv"
+          test -s "$OUTPUT/SUDACHI_WORD_COST_MANIFEST.json"
 
           BEFORE_LINES="$(wc -l < "$MOZC_DICTIONARY")"
           ADDED_LINES="$(wc -l < "$CORRECTED")"
@@ -308,6 +325,11 @@ jobs:
             echo
             echo "Sudachi correction summary:"
             cat "$OUTPUT/SUDACHI_CORRECTION_SUMMARY.txt"
+            echo
+            echo "Sudachi word-cost ranking asset:"
+            echo "sudachi_word_cost_v1.bin"
+            echo "Key: Unicode NFKC(reading) + U+001F + Unicode NFKC(surface)"
+            echo "Value: minimum signed dictionary cost (lower = stronger dictionary preference)"
             echo "岩手県立花巻南高等学校は完全読み1件だけを維持"
             echo "情報弱者向けビジネスは完全読み1件だけを維持"
             echo
@@ -350,6 +372,9 @@ jobs:
           test -s mozcdic-ut-sudachidict-original.txt.bz2
           test -s mozcdic-ut-sudachidict-corrected.txt.bz2
           test -s dictionary00-merged-corrected.txt.bz2
+          test -s sudachi_word_cost_v1.bin
+          test -s sudachi_word_cost_v1.tsv
+          test -s SUDACHI_WORD_COST_MANIFEST.json
 
           unzip -t native_libs.zip
           file mozc.data
@@ -369,6 +394,9 @@ jobs:
             mozcdic-ut-sudachidict-original.txt.bz2 \
             mozcdic-ut-sudachidict-corrected.txt.bz2 \
             dictionary00-merged-corrected.txt.bz2 \
+            sudachi_word_cost_v1.bin \
+            sudachi_word_cost_v1.tsv \
+            SUDACHI_WORD_COST_MANIFEST.json \
             > SHA256SUMS.txt
 
           cat MOZC_BUILD_INFO.txt
