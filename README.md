@@ -67,3 +67,16 @@
 - `dictionary00-merged-corrected.txt.bz2`
 - `MOZC_BUILD_INFO.txt`
 - `SHA256SUMS.txt`
+
+## Futatsumugi順位付け用 Sudachi word cost
+
+このBuilderは補正済みSudachi追加辞書から、IME候補順位付け専用の追加成果物も生成します。
+
+- `sudachi_word_cost_v1.bin`: Android向け固定長バイナリ
+- `sudachi_word_cost_v1.tsv`: 確認用TSV
+- `SUDACHI_WORD_COST_MANIFEST.json`: 生成条件・ハッシュ・統計
+
+キーは `NFKC(reading) + U+001F + NFKC(surface)` をUTF-16 code unit単位で
+FNV-1a 64bit化したものです。同じ読み・表記が複数行ある場合は最小costを採用します。
+costは「頻度そのもの」ではなくSudachi/Mozc辞書側の選好を示す補助値として使い、
+Futatsumugi本体ではTanaka/TUBELEXの実頻度と併用する想定です。
