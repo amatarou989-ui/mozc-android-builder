@@ -79,18 +79,26 @@ jobs:
           clang --version
           bazelisk version
 
+      - name: 診断用出力フォルダを初期化
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
+          mkdir -p "$OUTPUT"
+          {
+            echo "workflow_started=true"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_number=$GITHUB_RUN_NUMBER"
+            echo "mozc_ref=${{ inputs.mozc_ref }}"
+            echo "sudachi_ref=${{ inputs.sudachi_ref }}"
+          } > "$OUTPUT/WORKFLOW_STARTED.txt"
+
       - name: Mozcの追加依存関係を取得
         working-directory: mozc/src
         shell: bash
         run: |
           set -euxo pipefail
           python3 build_tools/update_deps.py
-
-      - name: 出力フォルダを作成
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/mozc-android-output"
 
       - name: Builderスクリプトをテスト
         shell: bash
@@ -121,10 +129,14 @@ jobs:
 
           grep -Fx "result=SUCCESS" "$REPORT"
           grep -F "candidate_word_private_fields=200-211" "$REPORT"
-          grep -F "futatsumugi_structure_cost" \
-            "$GITHUB_WORKSPACE/mozc/src/protocol/candidate_window.proto"
-          grep -F "set_futatsumugi_structure_cost" \
-            "$GITHUB_WORKSPACE/mozc/src/session/internal/session_output.cc"
+          PROTO_PATH="$(sed -n 's/^proto_path=//p' "$REPORT")"
+          CPP_PATH="$(sed -n 's/^cpp_path=//p' "$REPORT")"
+          test -n "$PROTO_PATH"
+          test -n "$CPP_PATH"
+          test -s "$PROTO_PATH"
+          test -s "$CPP_PATH"
+          grep -F "futatsumugi_structure_cost" "$PROTO_PATH"
+          grep -F "set_futatsumugi_structure_cost" "$CPP_PATH"
 
           cp "$FIELD_MAP" "$OUTPUT/futatsumugi_candidate_metadata_fields.tsv"
 
@@ -459,7 +471,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: mozc-android-sudachi-corrected-${{ github.run_number }}
-          path: mozc-android-output/
+          path: ${{ github.workspace }}/mozc-android-output/
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
