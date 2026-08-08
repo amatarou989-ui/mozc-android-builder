@@ -48,6 +48,34 @@ class PatchMozcCandidateMetadataTest(unittest.TestCase):
             self.assertEqual(proto_before, (src / "protocol" / "candidate_window.proto").read_text(encoding="utf-8"))
             self.assertEqual(cpp_before, (src / "session" / "internal" / "session_output.cc").read_text(encoding="utf-8"))
 
+    def test_patch_finds_relocated_session_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            src = self.make_tree(Path(temporary))
+            old_cpp = src / "session" / "internal" / "session_output.cc"
+            new_cpp = src / "session" / "session_output.cc"
+            new_cpp.parent.mkdir(parents=True, exist_ok=True)
+            old_cpp.replace(new_cpp)
+
+            result = patch_mozc_source(src)
+
+            self.assertEqual(new_cpp.resolve(), result.cpp_path)
+            self.assertIn(
+                "set_futatsumugi_structure_cost",
+                new_cpp.read_text(encoding="utf-8"),
+            )
+
+    def test_patch_finds_serializer_by_content_when_path_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            src = self.make_tree(Path(temporary))
+            old_cpp = src / "session" / "internal" / "session_output.cc"
+            new_cpp = src / "session" / "output" / "candidate_serializer.cc"
+            new_cpp.parent.mkdir(parents=True, exist_ok=True)
+            old_cpp.replace(new_cpp)
+
+            result = patch_mozc_source(src)
+
+            self.assertEqual(new_cpp.resolve(), result.cpp_path)
+
     def test_private_field_number_collision_stops(self):
         with tempfile.TemporaryDirectory() as temporary:
             src = self.make_tree(Path(temporary))

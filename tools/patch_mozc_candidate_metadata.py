@@ -42,6 +42,56 @@ class PatchResult:
     proto_changed: bool
     cpp_changed: bool
     candidate_definition: Path
+    proto_path: Path
+    cpp_path: Path
+
+
+def _find_proto(mozc_src: Path) -> Path:
+    preferred = mozc_src / "protocol" / "candidate_window.proto"
+    if preferred.is_file():
+        return preferred
+    matches = []
+    for path in mozc_src.rglob("candidate_window.proto"):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "message CandidateWord {" in text:
+            matches.append(path)
+    if len(matches) == 1:
+        return matches[0]
+    raise RuntimeError(
+        "Could not uniquely locate candidate_window.proto containing CandidateWord. "
+        f"matches={matches}"
+    )
+
+
+def _find_session_output(mozc_src: Path) -> Path:
+    preferred = (
+        mozc_src / "session" / "internal" / "session_output.cc",
+        mozc_src / "session" / "session_output.cc",
+    )
+    for path in preferred:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            if "void FillCandidateWord(" in text and "set_num_segments_in_candidate" in text:
+                return path
+
+    matches = []
+    session_root = mozc_src / "session"
+    search_root = session_root if session_root.is_dir() else mozc_src
+    for path in search_root.rglob("*.cc"):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "void FillCandidateWord(" in text and "set_num_segments_in_candidate" in text:
+            matches.append(path)
+    if len(matches) == 1:
+        return matches[0]
+    raise RuntimeError(
+        "Could not uniquely locate the Mozc CandidateWord serializer. "
+        "Searched for FillCandidateWord + set_num_segments_in_candidate; "
+        f"matches={matches}"
+    )
 
 
 def _find_candidate_definition(mozc_src: Path) -> Path:
@@ -116,16 +166,18 @@ def _patch_cpp(path: Path) -> bool:
 
 def patch_mozc_source(mozc_src: Path) -> PatchResult:
     mozc_src = mozc_src.resolve()
-    proto = mozc_src / "protocol" / "candidate_window.proto"
-    cpp = mozc_src / "session" / "internal" / "session_output.cc"
-    if not proto.is_file():
-        raise FileNotFoundError(proto)
-    if not cpp.is_file():
-        raise FileNotFoundError(cpp)
+    proto = _find_proto(mozc_src)
+    cpp = _find_session_output(mozc_src)
     candidate_definition = _find_candidate_definition(mozc_src)
     proto_changed = _patch_proto(proto)
     cpp_changed = _patch_cpp(cpp)
-    return PatchResult(proto_changed, cpp_changed, candidate_definition)
+    return PatchResult(
+        proto_changed=proto_changed,
+        cpp_changed=cpp_changed,
+        candidate_definition=candidate_definition,
+        proto_path=proto,
+        cpp_path=cpp,
+    )
 
 
 def write_report(path: Path, result: PatchResult, mozc_src: Path) -> None:
@@ -135,6 +187,8 @@ def write_report(path: Path, result: PatchResult, mozc_src: Path) -> None:
         f"status={status}",
         f"mozc_src={mozc_src.resolve()}",
         f"candidate_definition={result.candidate_definition}",
+        f"proto_path={result.proto_path}",
+        f"cpp_path={result.cpp_path}",
         f"proto_changed={str(result.proto_changed).lower()}",
         f"cpp_changed={str(result.cpp_changed).lower()}",
         "candidate_word_private_fields=200-211",
@@ -156,7 +210,8 @@ def main() -> int:
     print(
         "Mozc candidate metadata patch: "
         f"proto_changed={result.proto_changed}, cpp_changed={result.cpp_changed}, "
-        f"candidate_definition={result.candidate_definition}"
+        f"candidate_definition={result.candidate_definition}, "
+        f"proto_path={result.proto_path}, cpp_path={result.cpp_path}"
     )
     return 0
 
