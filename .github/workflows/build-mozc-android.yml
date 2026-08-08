@@ -92,13 +92,48 @@ jobs:
           set -euxo pipefail
           mkdir -p "$GITHUB_WORKSPACE/mozc-android-output"
 
-      - name: Sudachi補正・word cost生成スクリプトをテスト
+      - name: Builderスクリプトをテスト
         shell: bash
         run: |
           set -euxo pipefail
           python3 "$GITHUB_WORKSPACE/builder/tools/test_patch_sudachi_dictionary.py"
           PYTHONPATH="$GITHUB_WORKSPACE/builder/tools" \
-            python3 -m unittest -v test_build_sudachi_word_cost
+            python3 -m unittest -v \
+              test_build_sudachi_word_cost \
+              test_patch_mozc_candidate_metadata
+
+      - name: Mozc候補ランキングメタデータを有効化
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OUTPUT="$GITHUB_WORKSPACE/mozc-android-output"
+          PATCHER="$GITHUB_WORKSPACE/builder/tools/patch_mozc_candidate_metadata.py"
+          FIELD_MAP="$GITHUB_WORKSPACE/builder/data/futatsumugi_candidate_metadata_fields.tsv"
+          REPORT="$OUTPUT/MOZC_CANDIDATE_METADATA_PATCH.txt"
+
+          test -s "$PATCHER"
+          test -s "$FIELD_MAP"
+
+          python3 "$PATCHER" \
+            --mozc-src "$GITHUB_WORKSPACE/mozc/src" \
+            --report "$REPORT"
+
+          grep -Fx "result=SUCCESS" "$REPORT"
+          grep -F "candidate_word_private_fields=200-211" "$REPORT"
+          grep -F "futatsumugi_structure_cost" \
+            "$GITHUB_WORKSPACE/mozc/src/protocol/candidate_window.proto"
+          grep -F "set_futatsumugi_structure_cost" \
+            "$GITHUB_WORKSPACE/mozc/src/session/internal/session_output.cc"
+
+          cp "$FIELD_MAP" "$OUTPUT/futatsumugi_candidate_metadata_fields.tsv"
+
+          # LID/RIDの数値を品詞名へ引けるよう、今回のMozc refそのもののid.defも保存する。
+          POS_ID_DEF="$GITHUB_WORKSPACE/mozc/src/data/dictionary_oss/id.def"
+          test -s "$POS_ID_DEF"
+          cp "$POS_ID_DEF" "$OUTPUT/mozc_pos_id.def"
+
+          cat "$REPORT"
 
       - name: Sudachi辞書へ確認済み補正を適用
         shell: bash
@@ -339,6 +374,14 @@ jobs:
             echo "Sudachi dictionary license:"
             echo "Apache License 2.0"
             echo
+            echo "Futatsumugi CandidateWord ranking metadata:"
+            echo "Private proto fields: 200-211"
+            echo "lid/rid/cost/wcost/structure_cost/content_key/content_value/raw_attributes/source_info/consumed_key_size/inner_segment_boundary/cost_before_rescoring"
+            echo "Standard CandidateWord id/index/key/value/attributes/num_segments_in_candidate remain unchanged."
+            echo "POS ID map artifact: mozc_pos_id.def (same Mozc ref: data/dictionary_oss/id.def)"
+            echo
+            cat "$OUTPUT/MOZC_CANDIDATE_METADATA_PATCH.txt"
+            echo
             echo "Dataset target:"
             echo "//data_manager/oss:mozc_dataset_for_oss"
           } > "$OUTPUT/MOZC_BUILD_INFO.txt"
@@ -375,7 +418,11 @@ jobs:
           test -s sudachi_word_cost_v1.bin
           test -s sudachi_word_cost_v1.tsv
           test -s SUDACHI_WORD_COST_MANIFEST.json
+          test -s MOZC_CANDIDATE_METADATA_PATCH.txt
+          test -s futatsumugi_candidate_metadata_fields.tsv
+          test -s mozc_pos_id.def
 
+          grep -Fx "result=SUCCESS" MOZC_CANDIDATE_METADATA_PATCH.txt
           unzip -t native_libs.zip
           file mozc.data
 
@@ -397,6 +444,9 @@ jobs:
             sudachi_word_cost_v1.bin \
             sudachi_word_cost_v1.tsv \
             SUDACHI_WORD_COST_MANIFEST.json \
+            MOZC_CANDIDATE_METADATA_PATCH.txt \
+            futatsumugi_candidate_metadata_fields.tsv \
+            mozc_pos_id.def \
             > SHA256SUMS.txt
 
           cat MOZC_BUILD_INFO.txt
