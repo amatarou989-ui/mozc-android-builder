@@ -7,7 +7,15 @@ from patch_mozc_candidate_metadata import patch_mozc_source
 
 PROTO = """syntax = \"proto2\";\nmessage CandidateWord {\n  optional int32 id = 1;\n  optional uint32 index = 2;\n  optional string key = 3;\n  optional string value = 4;\n  repeated uint32 attributes = 6;\n  optional int32 num_segments_in_candidate = 7;\n  optional string log = 100;\n}\nmessage CandidateList {}\n"""
 
-CPP = """#include <cstdint>\nvoid FillCandidateWord(const Segment::Candidate &segment_candidate,\n                       const int id, const int index,\n                       const absl::string_view base_key,\n                       commands::CandidateWord *candidate_word_proto) {\n  candidate_word_proto->set_id(id);\n  candidate_word_proto->set_value(segment_candidate.value);\n  // number of segments\n  candidate_word_proto->set_num_segments_in_candidate(1);\n#ifndef NDEBUG\n  candidate_word_proto->set_log(segment_candidate.DebugString());\n#endif\n}\nvoid NextFunction() {}\n"""
+CPP = """#include <cstdint>\nvoid FillCandidateWord(const Segment::Candidate &segment_candidate,\n                       const int id, const int index,\n                       const absl::string_view base_key,\n                       commands::CandidateWord *candidate_word_proto) {\n  candidate_word_proto->set_id(id);\n  candidate_word_proto->set_value(segment_candidate.value);\n  if (segment_candidate.attributes & Segment::Candidate::USER_DICTIONARY) {\n    candidate_word_proto->add_attributes(commands::USER_DICTIONARY);\n  }\n  // number of segments\n  candidate_word_proto->set_num_segments_in_candidate(1);\n#ifndef NDEBUG\n  candidate_word_proto->set_log(segment_candidate.DebugString());\n#endif\n}\nvoid NextFunction() {}\n"""
+
+# Models the newer engine-side layout: different file, function and variable
+# names.  The patcher must discover it from actual CandidateWord writes.
+ENGINE_CPP = """#include <cstdint>\nnamespace mozc::engine::output {\nvoid MakeWord(const Segment::Candidate &cand, commands::CandidateWord *word) {\n  word->set_id(1);\n  word->set_key(cand.content_key);\n  word->set_value(\n      cand.value);\n  if (cand.attributes & Segment::Candidate::USER_DICTIONARY) {\n    word->add_attributes(commands::USER_DICTIONARY);\n  }\n  if (cand.attributes & Segment::Candidate::TYPING_CORRECTION) {\n    word->add_attributes(commands::TYPING_CORRECTION);\n  }\n  word->set_num_segments_in_candidate(1);\n}\n}\n"""
+
+# Deliberately looks similar but is the old rendered candidate proto, not
+# CandidateWord.  It must not win over the richer CandidateWord serializer.
+RENDERER_CPP = """void FillCandidate(const Segment::Candidate &cand,\n                   commands::Candidates_Candidate *candidate_proto) {\n  candidate_proto->set_value(cand.value);\n}\n"""
 
 CANDIDATE = """struct Candidate {\n  std::string content_key;\n  std::string content_value;\n  int cost;\n  int wcost;\n  int structure_cost;\n  int lid;\n  int rid;\n  uint32_t attributes;\n  uint32_t source_info;\n  size_t consumed_key_size;\n  std::vector<uint32_t> inner_segment_boundary;\n  int32_t cost_before_rescoring;\n};\n"""
 
@@ -48,33 +56,41 @@ class PatchMozcCandidateMetadataTest(unittest.TestCase):
             self.assertEqual(proto_before, (src / "protocol" / "candidate_window.proto").read_text(encoding="utf-8"))
             self.assertEqual(cpp_before, (src / "session" / "internal" / "session_output.cc").read_text(encoding="utf-8"))
 
-    def test_patch_finds_relocated_session_output(self):
+    def test_patch_finds_engine_side_serializer_with_renamed_function_and_variables(self):
         with tempfile.TemporaryDirectory() as temporary:
             src = self.make_tree(Path(temporary))
             old_cpp = src / "session" / "internal" / "session_output.cc"
-            new_cpp = src / "session" / "session_output.cc"
-            new_cpp.parent.mkdir(parents=True, exist_ok=True)
-            old_cpp.replace(new_cpp)
+            old_cpp.unlink()
+            engine_cpp = src / "engine" / "engine_output.cc"
+            engine_cpp.parent.mkdir(parents=True, exist_ok=True)
+            engine_cpp.write_text(ENGINE_CPP, encoding="utf-8")
 
             result = patch_mozc_source(src)
 
-            self.assertEqual(new_cpp.resolve(), result.cpp_path)
-            self.assertIn(
-                "set_futatsumugi_structure_cost",
-                new_cpp.read_text(encoding="utf-8"),
+            self.assertEqual(engine_cpp.resolve(), result.cpp_path.resolve())
+            self.assertEqual("word", result.serializer_proto_var)
+            self.assertEqual("cand", result.serializer_candidate_var)
+            patched = engine_cpp.read_text(encoding="utf-8")
+            self.assertIn("word->set_futatsumugi_lid(cand.lid);", patched)
+            self.assertIn("word->set_futatsumugi_structure_cost(cand.structure_cost);", patched)
+
+    def test_renderer_candidate_serializer_is_not_selected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            src = self.make_tree(Path(temporary))
+            engine_cpp = src / "engine" / "engine_output.cc"
+            engine_cpp.parent.mkdir(parents=True, exist_ok=True)
+            engine_cpp.write_text(ENGINE_CPP, encoding="utf-8")
+            renderer_cpp = src / "engine" / "renderer_output.cc"
+            renderer_cpp.write_text(RENDERER_CPP, encoding="utf-8")
+            (src / "session" / "internal" / "session_output.cc").unlink()
+
+            result = patch_mozc_source(src)
+
+            self.assertEqual(engine_cpp.resolve(), result.cpp_path.resolve())
+            self.assertNotIn(
+                "futatsumugi_lid",
+                renderer_cpp.read_text(encoding="utf-8"),
             )
-
-    def test_patch_finds_serializer_by_content_when_path_changes(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            src = self.make_tree(Path(temporary))
-            old_cpp = src / "session" / "internal" / "session_output.cc"
-            new_cpp = src / "session" / "output" / "candidate_serializer.cc"
-            new_cpp.parent.mkdir(parents=True, exist_ok=True)
-            old_cpp.replace(new_cpp)
-
-            result = patch_mozc_source(src)
-
-            self.assertEqual(new_cpp.resolve(), result.cpp_path)
 
     def test_private_field_number_collision_stops(self):
         with tempfile.TemporaryDirectory() as temporary:
