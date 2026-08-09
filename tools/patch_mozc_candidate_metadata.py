@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Expose Mozc candidate ranking metadata through CandidateWord.
 
-This builder-side patch is intentionally small and fail-closed.  It patches the
-Mozc source checked out by GitHub Actions, so Futatsumugi can read ranking
-signals from the normal evalCommand protobuf response without adding a new JNI
-entry point.
+This builder-side patch is intentionally fail-closed. It patches the Mozc
+source checked out by GitHub Actions so Futatsumugi can read ranking signals
+from the normal evalCommand protobuf response without adding a new JNI entry
+point.
 
-The CandidateWord serializer has moved between Mozc revisions.  Do not depend
-on a specific file/function name; locate the serializer by the actual protobuf
-write from Segment::Candidate.value and surrounding CandidateWord-only signals.
+Modern Mozc revisions can serialize CandidateWord from more than one code path.
+Do not assume a file/function name and do not force a single match. Locate every
+strong CandidateWord serializer by same-proto writes in a tight local scope,
+then attach the metadata block to each serializer.
 """
 
 from __future__ import annotations
@@ -39,8 +40,6 @@ REQUIRED_CANDIDATE_MEMBERS = (
     "cost_before_rescoring",
 )
 
-# Capture the actual proto pointer and Segment::Candidate variable instead of
-# assuming historical names such as candidate_word_proto/segment_candidate.
 SET_VALUE_RE = re.compile(
     r"(?P<proto>[A-Za-z_]\w*)\s*->\s*set_value\s*\(\s*"
     r"(?P<candidate>[A-Za-z_]\w*)\s*\.\s*value\s*\)\s*;",
@@ -65,11 +64,29 @@ class PatchResult:
     cpp_changed: bool
     candidate_definition: Path
     proto_path: Path
-    cpp_path: Path
-    serializer_proto_var: str
-    serializer_candidate_var: str
-    serializer_score: int
-    serializer_evidence: tuple[str, ...]
+    serializers: tuple[SerializerMatch, ...]
+    patched_cpp_paths: tuple[Path, ...]
+
+    # Backward-compatible accessors used by the workflow/tests.
+    @property
+    def cpp_path(self) -> Path:
+        return self.serializers[0].path
+
+    @property
+    def serializer_proto_var(self) -> str:
+        return self.serializers[0].proto_var
+
+    @property
+    def serializer_candidate_var(self) -> str:
+        return self.serializers[0].candidate_var
+
+    @property
+    def serializer_score(self) -> int:
+        return self.serializers[0].score
+
+    @property
+    def serializer_evidence(self) -> tuple[str, ...]:
+        return self.serializers[0].evidence
 
 
 def _find_proto(mozc_src: Path) -> Path:
@@ -91,39 +108,84 @@ def _find_proto(mozc_src: Path) -> Path:
     )
 
 
+def _same_proto_write(window: str, proto: str, method: str) -> bool:
+    return re.search(rf"\b{re.escape(proto)}\s*->\s*{re.escape(method)}\s*\(", window) is not None
+
+
+def _same_candidate_member(window: str, candidate: str, member: str) -> bool:
+    return re.search(rf"\b{re.escape(candidate)}\s*\.\s*{re.escape(member)}\b", window) is not None
+
+
 def _serializer_score(text: str, match: re.Match[str]) -> tuple[int, tuple[str, ...]]:
-    # Keep a generous local window.  CandidateWord serializers are compact,
-    # whereas unrelated candidate-window writers normally do not emit the
-    # CandidateWord attributes/segment-count fields.
-    lo = max(0, match.start() - 5000)
-    hi = min(len(text), match.end() + 5000)
+    # Deliberately tight: v4 used +/-5000 bytes, causing two nearby serializers
+    # to inherit each other's evidence. Same-proto checks prevent that.
+    lo = max(0, match.start() - 1400)
+    hi = min(len(text), match.end() + 1800)
     window = text[lo:hi]
+    proto = match.group("proto")
+    candidate = match.group("candidate")
     score = 0
     evidence: list[str] = []
 
     checks = (
-        ("CandidateWord", 6, "CandidateWord"),
-        ("num_segments_in_candidate", 6, "num_segments"),
-        ("add_attributes", 4, "attributes"),
-        ("USER_DICTIONARY", 3, "user_dictionary"),
-        ("content_key", 2, "content_key"),
-        ("TYPING_CORRECTION", 2, "typing_correction"),
-        ("SPELLING_CORRECTION", 2, "spelling_correction"),
+        ("set_id", 4, "id"),
+        ("set_index", 3, "index"),
+        ("set_key", 4, "key"),
+        ("add_attributes", 6, "attributes"),
+        ("set_num_segments_in_candidate", 10, "num_segments"),
+        ("set_log", 2, "log"),
     )
-    for needle, points, label in checks:
+    for method, points, label in checks:
+        if _same_proto_write(window, proto, method):
+            score += points
+            evidence.append(label)
+
+    # Strongest evidence: the pointer itself is typed as CandidateWord in the
+    # nearby function signature/body.
+    if re.search(
+        rf"(?:commands::)?CandidateWord\s*\*\s*{re.escape(proto)}\b",
+        window,
+    ):
+        score += 12
+        evidence.append("typed_candidate_word")
+
+    member_checks = (
+        ("attributes", 3, "candidate_attributes"),
+        ("content_key", 2, "content_key"),
+        ("content_value", 1, "content_value"),
+    )
+    for member, points, label in member_checks:
+        if _same_candidate_member(window, candidate, member):
+            score += points
+            evidence.append(label)
+
+    for needle, points, label in (
+        ("USER_DICTIONARY", 2, "user_dictionary"),
+        ("TYPING_CORRECTION", 1, "typing_correction"),
+        ("SPELLING_CORRECTION", 1, "spelling_correction"),
+    ):
         if needle in window:
             score += points
             evidence.append(label)
 
-    # A file in engine/session is much more likely to be the command-output
-    # serializer than converters/tests that happen to construct protos.
     return score, tuple(evidence)
 
 
-def _find_candidate_serializer(mozc_src: Path) -> SerializerMatch:
-    candidates: list[SerializerMatch] = []
-    # Serializer implementations have historically lived in session/ and
-    # engine/. Search all production C++ as a fallback so future moves are OK.
+def _is_strong_serializer(item: SerializerMatch) -> bool:
+    evidence = set(item.evidence)
+    # Either an explicit CandidateWord pointer type, or the exact proto receives
+    # both segment count and attributes. Rendered Candidates::Candidate paths do
+    # not satisfy this.
+    structurally_candidate_word = (
+        "typed_candidate_word" in evidence
+        or {"num_segments", "attributes"}.issubset(evidence)
+    )
+    return structurally_candidate_word and item.score >= 16
+
+
+def _find_candidate_serializers(mozc_src: Path) -> tuple[SerializerMatch, ...]:
+    found: list[SerializerMatch] = []
+    near: list[str] = []
     for path in mozc_src.rglob("*.cc"):
         if not path.is_file():
             continue
@@ -135,55 +197,40 @@ def _find_candidate_serializer(mozc_src: Path) -> SerializerMatch:
             continue
         for match in SET_VALUE_RE.finditer(text):
             score, evidence = _serializer_score(text, match)
-            # Require at least one CandidateWord-specific signal.  This rejects
-            # the older Candidates::Candidate renderer serializer.
-            if score < 10:
-                continue
-            candidates.append(
-                SerializerMatch(
-                    path=path,
-                    start=match.start(),
-                    end=match.end(),
-                    proto_var=match.group("proto"),
-                    candidate_var=match.group("candidate"),
-                    score=score,
-                    evidence=evidence,
-                )
+            item = SerializerMatch(
+                path=path,
+                start=match.start(),
+                end=match.end(),
+                proto_var=match.group("proto"),
+                candidate_var=match.group("candidate"),
+                score=score,
+                evidence=evidence,
             )
+            if _is_strong_serializer(item):
+                found.append(item)
+            elif score >= 8:
+                near.append(
+                    f"{path}:{match.start()}:score={score}:"
+                    f"proto={item.proto_var}:candidate={item.candidate_var}:"
+                    f"evidence={','.join(evidence)}"
+                )
 
-    if not candidates:
-        # Add useful diagnostics directly to the exception. GitHub Actions will
-        # then show the closest source locations instead of only "matches=[]".
-        near: list[str] = []
-        for path in mozc_src.rglob("*.cc"):
-            if not path.is_file() or path.name.endswith("_test.cc"):
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            if "CandidateWord" in text or "num_segments_in_candidate" in text:
-                near.append(str(path))
+    if not found:
         raise RuntimeError(
-            "Could not locate the Mozc CandidateWord serializer by protobuf writes. "
-            "Expected a '<proto>->set_value(<SegmentCandidate>.value)' write near "
-            "CandidateWord attributes/segment metadata. "
-            f"candidate_word_related_files={near[:20]}"
+            "Could not locate a strong Mozc CandidateWord serializer. "
+            "Expected the same proto variable to receive CandidateWord-specific "
+            "writes such as set_num_segments_in_candidate/add_attributes or to "
+            "be explicitly typed CandidateWord*. "
+            f"near_matches={near[:30]}"
         )
 
-    candidates.sort(key=lambda item: (-item.score, str(item.path), item.start))
-    best = candidates[0]
-    tied = [item for item in candidates if item.score == best.score]
-    # Multiple hits in one file can occur when the same helper is called in
-    # different branches, but multiple distinct best locations are ambiguous.
-    unique_locations = {(str(item.path), item.start) for item in tied}
-    if len(unique_locations) != 1:
-        diagnostics = [
-            f"{item.path}:{item.start}:score={item.score}:evidence={','.join(item.evidence)}"
-            for item in tied[:20]
-        ]
-        raise RuntimeError(
-            "Could not uniquely locate the Mozc CandidateWord serializer; "
-            f"best_matches={diagnostics}"
-        )
-    return best
+    # Keep every independently validated serializer. Modern Mozc can have more
+    # than one CandidateWord output path. De-duplicate only exact same anchors.
+    unique: dict[tuple[str, int, str, str], SerializerMatch] = {}
+    for item in found:
+        unique[(str(item.path), item.start, item.proto_var, item.candidate_var)] = item
+    result = tuple(sorted(unique.values(), key=lambda x: (str(x.path), x.start)))
+    return result
 
 
 def _find_candidate_definition(mozc_src: Path) -> Path:
@@ -220,8 +267,6 @@ def _patch_proto(path: Path) -> bool:
                 f"CandidateWord field number {field_number} is already used. "
                 "Choose a new private range instead of colliding with upstream Mozc."
             )
-    # Modern Mozc has the debug log at field 100. Insert before it to keep the
-    # private block visibly separate from upstream fields.
     anchor = "  optional string log = 100;"
     anchor_pos = block.find(anchor)
     if anchor_pos < 0:
@@ -238,56 +283,103 @@ def _patch_proto(path: Path) -> bool:
 def _metadata_cpp(proto_var: str, candidate_var: str) -> str:
     p = proto_var
     c = candidate_var
-    return f"""\n  // Futatsumugi ranking metadata: keep this block in sync with candidate_window.proto.\n  {p}->set_futatsumugi_lid({c}.lid);\n  {p}->set_futatsumugi_rid({c}.rid);\n  {p}->set_futatsumugi_cost({c}.cost);\n  {p}->set_futatsumugi_wcost({c}.wcost);\n  {p}->set_futatsumugi_structure_cost({c}.structure_cost);\n  {p}->set_futatsumugi_content_key({c}.content_key);\n  {p}->set_futatsumugi_content_value({c}.content_value);\n  {p}->set_futatsumugi_raw_attributes(\n      static_cast<uint32_t>({c}.attributes));\n  {p}->set_futatsumugi_source_info(\n      static_cast<uint32_t>({c}.source_info));\n  {p}->set_futatsumugi_consumed_key_size(\n      static_cast<uint64_t>({c}.consumed_key_size));\n  for (const uint32_t encoded_boundary : {c}.inner_segment_boundary) {{\n    {p}->add_futatsumugi_inner_segment_boundary(encoded_boundary);\n  }}\n  {p}->set_futatsumugi_cost_before_rescoring(\n      {c}.cost_before_rescoring);\n"""
+    return f"""
+  // Futatsumugi ranking metadata: keep this block in sync with candidate_window.proto.
+  {p}->set_futatsumugi_lid({c}.lid);
+  {p}->set_futatsumugi_rid({c}.rid);
+  {p}->set_futatsumugi_cost({c}.cost);
+  {p}->set_futatsumugi_wcost({c}.wcost);
+  {p}->set_futatsumugi_structure_cost({c}.structure_cost);
+  {p}->set_futatsumugi_content_key({c}.content_key);
+  {p}->set_futatsumugi_content_value({c}.content_value);
+  {p}->set_futatsumugi_raw_attributes(
+      static_cast<uint32_t>({c}.attributes));
+  {p}->set_futatsumugi_source_info(
+      static_cast<uint32_t>({c}.source_info));
+  {p}->set_futatsumugi_consumed_key_size(
+      static_cast<uint64_t>({c}.consumed_key_size));
+  for (const auto encoded_boundary : {c}.inner_segment_boundary) {{
+    {p}->add_futatsumugi_inner_segment_boundary(
+        static_cast<uint32_t>(encoded_boundary));
+  }}
+  {p}->set_futatsumugi_cost_before_rescoring(
+      {c}.cost_before_rescoring);
+"""
 
 
-def _patch_cpp(match: SerializerMatch) -> bool:
-    path = match.path
-    text = path.read_text(encoding="utf-8")
-    if CPP_MARKER in text:
-        return False
-    # Re-find after proto patch to guard against stale offsets if this function
-    # is reused independently in tests/tools.
-    found = None
-    for candidate in SET_VALUE_RE.finditer(text):
-        if (
-            candidate.group("proto") == match.proto_var
-            and candidate.group("candidate") == match.candidate_var
-            and abs(candidate.start() - match.start) < 100
-        ):
-            found = candidate
-            break
-    if found is None:
-        raise RuntimeError(
-            f"CandidateWord set_value anchor changed before patching: {path}"
-        )
-    insert_at = found.end()
-    text = (
-        text[:insert_at]
-        + _metadata_cpp(match.proto_var, match.candidate_var)
-        + text[insert_at:]
+def _has_local_metadata(text: str, anchor_end: int, proto_var: str) -> bool:
+    tail = text[anchor_end: min(len(text), anchor_end + 2200)]
+    return (
+        CPP_MARKER in tail
+        and f"{proto_var}->set_futatsumugi_lid(" in tail
+        and f"{proto_var}->set_futatsumugi_cost_before_rescoring(" in tail
     )
-    path.write_text(text, encoding="utf-8")
-    return True
+
+
+def _patch_cpp_matches(path: Path, matches: list[SerializerMatch]) -> bool:
+    text = path.read_text(encoding="utf-8")
+    changed = False
+
+    # Re-discover against current text, then apply from the end of the file so
+    # earlier offsets remain valid. Match by approximate original location and
+    # variable pair; this also makes a second invocation idempotent.
+    current = list(SET_VALUE_RE.finditer(text))
+    insertions: list[tuple[int, str]] = []
+    for wanted in matches:
+        compatible = [
+            m for m in current
+            if m.group("proto") == wanted.proto_var
+            and m.group("candidate") == wanted.candidate_var
+            and abs(m.start() - wanted.start) < 600
+        ]
+        if len(compatible) != 1:
+            raise RuntimeError(
+                "CandidateWord serializer anchor changed before patching: "
+                f"{path}; proto={wanted.proto_var}; candidate={wanted.candidate_var}; "
+                f"compatible={[(m.start(), m.end()) for m in compatible]}"
+            )
+        anchor = compatible[0]
+        if _has_local_metadata(text, anchor.end(), wanted.proto_var):
+            continue
+        insertions.append(
+            (anchor.end(), _metadata_cpp(wanted.proto_var, wanted.candidate_var))
+        )
+
+    for pos, block in sorted(insertions, key=lambda item: item[0], reverse=True):
+        text = text[:pos] + block + text[pos:]
+        changed = True
+    if changed:
+        path.write_text(text, encoding="utf-8")
+    return changed
+
+
+def _patch_all_cpp(serializers: tuple[SerializerMatch, ...]) -> tuple[bool, tuple[Path, ...]]:
+    by_path: dict[Path, list[SerializerMatch]] = {}
+    for item in serializers:
+        by_path.setdefault(item.path, []).append(item)
+    changed = False
+    patched_paths: list[Path] = []
+    for path, matches in by_path.items():
+        path_changed = _patch_cpp_matches(path, matches)
+        changed = changed or path_changed
+        patched_paths.append(path)
+    return changed, tuple(sorted(patched_paths, key=str))
 
 
 def patch_mozc_source(mozc_src: Path) -> PatchResult:
     mozc_src = mozc_src.resolve()
     proto = _find_proto(mozc_src)
-    serializer = _find_candidate_serializer(mozc_src)
+    serializers = _find_candidate_serializers(mozc_src)
     candidate_definition = _find_candidate_definition(mozc_src)
     proto_changed = _patch_proto(proto)
-    cpp_changed = _patch_cpp(serializer)
+    cpp_changed, patched_cpp_paths = _patch_all_cpp(serializers)
     return PatchResult(
         proto_changed=proto_changed,
         cpp_changed=cpp_changed,
         candidate_definition=candidate_definition,
         proto_path=proto,
-        cpp_path=serializer.path,
-        serializer_proto_var=serializer.proto_var,
-        serializer_candidate_var=serializer.candidate_var,
-        serializer_score=serializer.score,
-        serializer_evidence=serializer.evidence,
+        serializers=serializers,
+        patched_cpp_paths=patched_cpp_paths,
     )
 
 
@@ -299,7 +391,10 @@ def write_report(path: Path, result: PatchResult, mozc_src: Path) -> None:
         f"mozc_src={mozc_src.resolve()}",
         f"candidate_definition={result.candidate_definition}",
         f"proto_path={result.proto_path}",
+        # Keep cpp_path for old workflow consumers, plus complete multi-path data.
         f"cpp_path={result.cpp_path}",
+        f"serializer_count={len(result.serializers)}",
+        f"cpp_paths={'|'.join(str(p) for p in result.patched_cpp_paths)}",
         f"serializer_proto_var={result.serializer_proto_var}",
         f"serializer_candidate_var={result.serializer_candidate_var}",
         f"serializer_score={result.serializer_score}",
@@ -310,6 +405,17 @@ def write_report(path: Path, result: PatchResult, mozc_src: Path) -> None:
         "metadata=lid,rid,cost,wcost,structure_cost,content_key,content_value,raw_attributes,source_info,consumed_key_size,inner_segment_boundary,cost_before_rescoring",
         "standard_fields_reused=id(1),index(2),key(3),value(4),attributes(6),num_segments_in_candidate(7)",
     ]
+    for index, item in enumerate(result.serializers, start=1):
+        lines.extend(
+            [
+                f"serializer_{index}_path={item.path}",
+                f"serializer_{index}_offset={item.start}",
+                f"serializer_{index}_proto_var={item.proto_var}",
+                f"serializer_{index}_candidate_var={item.candidate_var}",
+                f"serializer_{index}_score={item.score}",
+                f"serializer_{index}_evidence={','.join(item.evidence)}",
+            ]
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -326,10 +432,15 @@ def main() -> int:
         "Mozc candidate metadata patch: "
         f"proto_changed={result.proto_changed}, cpp_changed={result.cpp_changed}, "
         f"candidate_definition={result.candidate_definition}, "
-        f"proto_path={result.proto_path}, cpp_path={result.cpp_path}, "
-        f"serializer={result.serializer_proto_var}/{result.serializer_candidate_var}, "
-        f"score={result.serializer_score}, evidence={result.serializer_evidence}"
+        f"proto_path={result.proto_path}, serializers={len(result.serializers)}, "
+        f"cpp_paths={[str(p) for p in result.patched_cpp_paths]}"
     )
+    for index, item in enumerate(result.serializers, start=1):
+        print(
+            f"  serializer[{index}] path={item.path} offset={item.start} "
+            f"vars={item.proto_var}/{item.candidate_var} score={item.score} "
+            f"evidence={item.evidence}"
+        )
     return 0
 
 

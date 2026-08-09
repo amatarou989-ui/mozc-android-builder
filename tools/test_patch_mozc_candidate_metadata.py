@@ -15,6 +15,31 @@ ENGINE_CPP = """#include <cstdint>\nnamespace mozc::engine::output {\nvoid MakeW
 
 # Deliberately looks similar but is the old rendered candidate proto, not
 # CandidateWord.  It must not win over the richer CandidateWord serializer.
+
+MULTI_ENGINE_CPP = """#include <cstdint>
+namespace mozc::engine::output {
+void MakeWordA(const Segment::Candidate &cand, commands::CandidateWord *word) {
+  word->set_id(1);
+  word->set_key(cand.content_key);
+  word->set_value(cand.value);
+  if (cand.attributes & Segment::Candidate::USER_DICTIONARY) {
+    word->add_attributes(commands::USER_DICTIONARY);
+  }
+  word->set_num_segments_in_candidate(1);
+}
+void MakeWordB(const Segment::Candidate &candidate, commands::CandidateWord *candidate_word) {
+  candidate_word->set_id(2);
+  candidate_word->set_index(0);
+  candidate_word->set_key(candidate.content_key);
+  candidate_word->set_value(candidate.value);
+  if (candidate.attributes & Segment::Candidate::TYPING_CORRECTION) {
+    candidate_word->add_attributes(commands::TYPING_CORRECTION);
+  }
+  candidate_word->set_num_segments_in_candidate(2);
+}
+}
+"""
+
 RENDERER_CPP = """void FillCandidate(const Segment::Candidate &cand,\n                   commands::Candidates_Candidate *candidate_proto) {\n  candidate_proto->set_value(cand.value);\n}\n"""
 
 CANDIDATE = """struct Candidate {\n  std::string content_key;\n  std::string content_value;\n  int cost;\n  int wcost;\n  int structure_cost;\n  int lid;\n  int rid;\n  uint32_t attributes;\n  uint32_t source_info;\n  size_t consumed_key_size;\n  std::vector<uint32_t> inner_segment_boundary;\n  int32_t cost_before_rescoring;\n};\n"""
@@ -73,6 +98,33 @@ class PatchMozcCandidateMetadataTest(unittest.TestCase):
             patched = engine_cpp.read_text(encoding="utf-8")
             self.assertIn("word->set_futatsumugi_lid(cand.lid);", patched)
             self.assertIn("word->set_futatsumugi_structure_cost(cand.structure_cost);", patched)
+
+    def test_multiple_candidate_word_serializers_are_all_patched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            src = self.make_tree(Path(temporary))
+            old_cpp = src / "session" / "internal" / "session_output.cc"
+            old_cpp.unlink()
+            engine_cpp = src / "engine" / "engine_output.cc"
+            engine_cpp.parent.mkdir(parents=True, exist_ok=True)
+            engine_cpp.write_text(MULTI_ENGINE_CPP, encoding="utf-8")
+
+            result = patch_mozc_source(src)
+
+            self.assertEqual(2, len(result.serializers))
+            patched = engine_cpp.read_text(encoding="utf-8")
+            self.assertEqual(2, patched.count("Futatsumugi ranking metadata"))
+            self.assertIn("word->set_futatsumugi_lid(cand.lid);", patched)
+            self.assertIn(
+                "candidate_word->set_futatsumugi_lid(candidate.lid);",
+                patched,
+            )
+
+            second = patch_mozc_source(src)
+            self.assertFalse(second.cpp_changed)
+            self.assertEqual(
+                2,
+                engine_cpp.read_text(encoding="utf-8").count("Futatsumugi ranking metadata"),
+            )
 
     def test_renderer_candidate_serializer_is_not_selected(self):
         with tempfile.TemporaryDirectory() as temporary:
