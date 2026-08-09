@@ -106,9 +106,12 @@ Futatsumugi本体ではTanaka/TUBELEXの実頻度と併用する想定です。
 | `futatsumugi_cost_before_rescoring` | 再スコア前cost | Mozc再ランキングの影響比較 |
 
 詳細なfield numberは `data/futatsumugi_candidate_metadata_fields.tsv` に固定しています。
-GitHub ActionsではMozc checkout後に `tools/patch_mozc_candidate_metadata.py` を実行し、
-想定しているCandidate構造が見つからない場合は**推測で継続せずビルドを停止**します。
-そのためMozcのrefを更新したときも、構造変更を見落としたまま誤ったバイナリを作りません。
+これらはすべて追加Evidenceであり、上流Mozcに該当メンバーが無いfieldは未設定のまま返ります。
+GitHub ActionsではMozc checkout後に `tools/patch_mozc_candidate_metadata.py` を実行します。
+CandidateWordの出力経路は厳密に検出しますが、`Segment::Candidate` の内部レイアウト自体は
+固定しません。各ランキングメンバーはC++のコンパイル時検出（SFINAE）で確認し、
+そのMozc refに存在するものだけprotobufへ設定します。存在しない項目はfield自体を予約したまま
+未設定になるため、Mozc側でメンバーが移動・削除されても無関係な項目までビルドを止めません。
 
 ### なぜこの項目を出すか
 

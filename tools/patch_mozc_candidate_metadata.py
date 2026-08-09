@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Expose Mozc candidate ranking metadata through CandidateWord.
 
-This builder-side patch is intentionally fail-closed. It patches the Mozc
-source checked out by GitHub Actions so Futatsumugi can read ranking signals
-from the normal evalCommand protobuf response without adding a new JNI entry
-point.
+This builder-side patch exposes optional Mozc ranking metadata through the
+existing CandidateWord protobuf path, without adding a new JNI entry point.
 
-Modern Mozc revisions can serialize CandidateWord from more than one code path.
-Do not assume a file/function name and do not force a single match. Locate every
-strong CandidateWord serializer by same-proto writes in a tight local scope,
-then attach the metadata block to each serializer.
+Modern Mozc revisions can serialize CandidateWord from more than one code path
+and can move/remove individual Segment::Candidate members. Do not hard-code a
+Candidate layout. Every strong CandidateWord serializer is patched, while the
+metadata helper uses C++ compile-time detection so an unavailable upstream
+member is simply left unset in the protobuf instead of breaking the build.
 """
 
 from __future__ import annotations
@@ -24,21 +23,6 @@ PROTO_MARKER = "Futatsumugi private ranking metadata."
 CPP_MARKER = "Futatsumugi ranking metadata: keep this block in sync with candidate_window.proto."
 
 PROTO_FIELDS = """  // Futatsumugi private ranking metadata.\n  // Field numbers 200-211 are intentionally kept outside Mozc's normal CandidateWord range.\n  // Older clients safely ignore these unknown proto2 fields.\n  optional int32 futatsumugi_lid = 200 [default = -1];\n  optional int32 futatsumugi_rid = 201 [default = -1];\n  optional int32 futatsumugi_cost = 202;\n  optional int32 futatsumugi_wcost = 203;\n  optional int32 futatsumugi_structure_cost = 204;\n  optional string futatsumugi_content_key = 205;\n  optional string futatsumugi_content_value = 206;\n  optional uint32 futatsumugi_raw_attributes = 207;\n  optional uint32 futatsumugi_source_info = 208;\n  optional uint64 futatsumugi_consumed_key_size = 209;\n  repeated uint32 futatsumugi_inner_segment_boundary = 210 [packed = true];\n  optional int32 futatsumugi_cost_before_rescoring = 211;\n\n"""
-
-REQUIRED_CANDIDATE_MEMBERS = (
-    "content_key",
-    "content_value",
-    "cost",
-    "wcost",
-    "structure_cost",
-    "lid",
-    "rid",
-    "attributes",
-    "source_info",
-    "consumed_key_size",
-    "inner_segment_boundary",
-    "cost_before_rescoring",
-)
 
 SET_VALUE_RE = re.compile(
     r"(?P<proto>[A-Za-z_]\w*)\s*->\s*set_value\s*\(\s*"
@@ -233,23 +217,134 @@ def _find_candidate_serializers(mozc_src: Path) -> tuple[SerializerMatch, ...]:
     return result
 
 
-def _find_candidate_definition(mozc_src: Path) -> Path:
-    candidates = (
-        mozc_src / "converter" / "candidate.h",
-        mozc_src / "converter" / "segments.h",
-    )
-    for path in candidates:
-        if not path.is_file():
-            continue
-        text = path.read_text(encoding="utf-8")
-        if all(member in text for member in REQUIRED_CANDIDATE_MEMBERS):
-            return path
-    checked = ", ".join(str(path) for path in candidates)
-    raise RuntimeError(
-        "Mozc Candidate layout did not contain the expected ranking members. "
-        f"Checked: {checked}. Upstream source may have changed; stop rather than patching blindly."
-    )
+CPP_HELPER_MARKER = "Futatsumugi optional candidate metadata helpers."
 
+
+def _cpp_helpers() -> str:
+    # Keep this C++11-compatible: Mozc refs may change their language standard.
+    # Each accessor is SFINAE-gated so removed/moved Candidate members do not
+    # make the whole native build fail. Protobuf fields remain absent when the
+    # corresponding upstream evidence is unavailable.
+    return r"""
+// Futatsumugi optional candidate metadata helpers.
+// Individual Segment::Candidate members are detected at compile time.
+#include <cstdint>
+#include <type_traits>
+#include <utility>
+
+namespace {
+
+template <typename...>
+using FutatsumugiVoidT = void;
+
+#define FUTATSUMUGI_DEFINE_SCALAR_METADATA(NAME, SETTER, CAST_TYPE)                 \
+  template <typename T, typename = void>                                            \
+  struct FutatsumugiHas_##NAME : std::false_type {};                                \
+  template <typename T>                                                             \
+  struct FutatsumugiHas_##NAME<                                                     \
+      T, FutatsumugiVoidT<decltype(std::declval<const T &>().NAME)>>                \
+      : std::true_type {};                                                          \
+  template <typename T>                                                             \
+  typename std::enable_if<FutatsumugiHas_##NAME<T>::value>::type                    \
+  FutatsumugiSet_##NAME(::mozc::commands::CandidateWord *out, const T &candidate) { \
+    out->SETTER(static_cast<CAST_TYPE>(candidate.NAME));                             \
+  }                                                                                  \
+  template <typename T>                                                             \
+  typename std::enable_if<!FutatsumugiHas_##NAME<T>::value>::type                   \
+  FutatsumugiSet_##NAME(::mozc::commands::CandidateWord *, const T &) {}
+
+#define FUTATSUMUGI_DEFINE_STRING_METADATA(NAME, SETTER)                            \
+  template <typename T, typename = void>                                            \
+  struct FutatsumugiHas_##NAME : std::false_type {};                                \
+  template <typename T>                                                             \
+  struct FutatsumugiHas_##NAME<                                                     \
+      T, FutatsumugiVoidT<decltype(std::declval<const T &>().NAME)>>                \
+      : std::true_type {};                                                          \
+  template <typename T>                                                             \
+  typename std::enable_if<FutatsumugiHas_##NAME<T>::value>::type                    \
+  FutatsumugiSet_##NAME(::mozc::commands::CandidateWord *out, const T &candidate) { \
+    out->SETTER(candidate.NAME);                                                     \
+  }                                                                                  \
+  template <typename T>                                                             \
+  typename std::enable_if<!FutatsumugiHas_##NAME<T>::value>::type                   \
+  FutatsumugiSet_##NAME(::mozc::commands::CandidateWord *, const T &) {}
+
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(lid, set_futatsumugi_lid, int32_t)
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(rid, set_futatsumugi_rid, int32_t)
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(cost, set_futatsumugi_cost, int32_t)
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(wcost, set_futatsumugi_wcost, int32_t)
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(
+    structure_cost, set_futatsumugi_structure_cost, int32_t)
+FUTATSUMUGI_DEFINE_STRING_METADATA(content_key, set_futatsumugi_content_key)
+FUTATSUMUGI_DEFINE_STRING_METADATA(content_value, set_futatsumugi_content_value)
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(
+    attributes, set_futatsumugi_raw_attributes, uint32_t)
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(
+    source_info, set_futatsumugi_source_info, uint32_t)
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(
+    consumed_key_size, set_futatsumugi_consumed_key_size, uint64_t)
+FUTATSUMUGI_DEFINE_SCALAR_METADATA(
+    cost_before_rescoring, set_futatsumugi_cost_before_rescoring, int32_t)
+
+template <typename T, typename = void>
+struct FutatsumugiHasInnerSegmentBoundary : std::false_type {};
+template <typename T>
+struct FutatsumugiHasInnerSegmentBoundary<
+    T, FutatsumugiVoidT<
+           decltype(std::declval<const T &>().inner_segment_boundary.begin()),
+           decltype(std::declval<const T &>().inner_segment_boundary.end())>>
+    : std::true_type {};
+
+template <typename T>
+typename std::enable_if<FutatsumugiHasInnerSegmentBoundary<T>::value>::type
+FutatsumugiSetInnerSegmentBoundary(
+    ::mozc::commands::CandidateWord *out, const T &candidate) {
+  for (const auto encoded_boundary : candidate.inner_segment_boundary) {
+    out->add_futatsumugi_inner_segment_boundary(
+        static_cast<uint32_t>(encoded_boundary));
+  }
+}
+template <typename T>
+typename std::enable_if<!FutatsumugiHasInnerSegmentBoundary<T>::value>::type
+FutatsumugiSetInnerSegmentBoundary(
+    ::mozc::commands::CandidateWord *, const T &) {}
+
+template <typename T>
+void FutatsumugiSetCandidateMetadata(
+    ::mozc::commands::CandidateWord *out, const T &candidate) {
+  FutatsumugiSet_lid(out, candidate);
+  FutatsumugiSet_rid(out, candidate);
+  FutatsumugiSet_cost(out, candidate);
+  FutatsumugiSet_wcost(out, candidate);
+  FutatsumugiSet_structure_cost(out, candidate);
+  FutatsumugiSet_content_key(out, candidate);
+  FutatsumugiSet_content_value(out, candidate);
+  FutatsumugiSet_attributes(out, candidate);
+  FutatsumugiSet_source_info(out, candidate);
+  FutatsumugiSet_consumed_key_size(out, candidate);
+  FutatsumugiSetInnerSegmentBoundary(out, candidate);
+  FutatsumugiSet_cost_before_rescoring(out, candidate);
+}
+
+#undef FUTATSUMUGI_DEFINE_STRING_METADATA
+#undef FUTATSUMUGI_DEFINE_SCALAR_METADATA
+
+}  // namespace
+
+"""
+
+
+def _insert_cpp_helpers(path: Path) -> bool:
+    text = path.read_text(encoding="utf-8")
+    if CPP_HELPER_MARKER in text:
+        return False
+    include_matches = list(re.finditer(r"^#include[^\n]*\n", text, re.MULTILINE))
+    if not include_matches:
+        raise RuntimeError(f"Could not locate C++ include block for metadata helpers: {path}")
+    insert_at = include_matches[-1].end()
+    text = text[:insert_at] + _cpp_helpers() + text[insert_at:]
+    path.write_text(text, encoding="utf-8")
+    return True
 
 def _patch_proto(path: Path) -> bool:
     text = path.read_text(encoding="utf-8")
@@ -281,38 +376,16 @@ def _patch_proto(path: Path) -> bool:
 
 
 def _metadata_cpp(proto_var: str, candidate_var: str) -> str:
-    p = proto_var
-    c = candidate_var
     return f"""
   // Futatsumugi ranking metadata: keep this block in sync with candidate_window.proto.
-  {p}->set_futatsumugi_lid({c}.lid);
-  {p}->set_futatsumugi_rid({c}.rid);
-  {p}->set_futatsumugi_cost({c}.cost);
-  {p}->set_futatsumugi_wcost({c}.wcost);
-  {p}->set_futatsumugi_structure_cost({c}.structure_cost);
-  {p}->set_futatsumugi_content_key({c}.content_key);
-  {p}->set_futatsumugi_content_value({c}.content_value);
-  {p}->set_futatsumugi_raw_attributes(
-      static_cast<uint32_t>({c}.attributes));
-  {p}->set_futatsumugi_source_info(
-      static_cast<uint32_t>({c}.source_info));
-  {p}->set_futatsumugi_consumed_key_size(
-      static_cast<uint64_t>({c}.consumed_key_size));
-  for (const auto encoded_boundary : {c}.inner_segment_boundary) {{
-    {p}->add_futatsumugi_inner_segment_boundary(
-        static_cast<uint32_t>(encoded_boundary));
-  }}
-  {p}->set_futatsumugi_cost_before_rescoring(
-      {c}.cost_before_rescoring);
+  FutatsumugiSetCandidateMetadata({proto_var}, {candidate_var});
 """
-
 
 def _has_local_metadata(text: str, anchor_end: int, proto_var: str) -> bool:
     tail = text[anchor_end: min(len(text), anchor_end + 2200)]
     return (
         CPP_MARKER in tail
-        and f"{proto_var}->set_futatsumugi_lid(" in tail
-        and f"{proto_var}->set_futatsumugi_cost_before_rescoring(" in tail
+        and f"FutatsumugiSetCandidateMetadata({proto_var}," in tail
     )
 
 
@@ -360,8 +433,11 @@ def _patch_all_cpp(serializers: tuple[SerializerMatch, ...]) -> tuple[bool, tupl
     changed = False
     patched_paths: list[Path] = []
     for path, matches in by_path.items():
+        # Patch serializer anchors before inserting the large helper block so
+        # discovery offsets still refer to the same source positions.
         path_changed = _patch_cpp_matches(path, matches)
-        changed = changed or path_changed
+        helper_changed = _insert_cpp_helpers(path)
+        changed = changed or helper_changed or path_changed
         patched_paths.append(path)
     return changed, tuple(sorted(patched_paths, key=str))
 
@@ -370,7 +446,7 @@ def patch_mozc_source(mozc_src: Path) -> PatchResult:
     mozc_src = mozc_src.resolve()
     proto = _find_proto(mozc_src)
     serializers = _find_candidate_serializers(mozc_src)
-    candidate_definition = _find_candidate_definition(mozc_src)
+    candidate_definition = Path("compile-time-optional-member-detection")
     proto_changed = _patch_proto(proto)
     cpp_changed, patched_cpp_paths = _patch_all_cpp(serializers)
     return PatchResult(
@@ -403,6 +479,7 @@ def write_report(path: Path, result: PatchResult, mozc_src: Path) -> None:
         f"cpp_changed={str(result.cpp_changed).lower()}",
         "candidate_word_private_fields=200-211",
         "metadata=lid,rid,cost,wcost,structure_cost,content_key,content_value,raw_attributes,source_info,consumed_key_size,inner_segment_boundary,cost_before_rescoring",
+        "metadata_member_policy=compile_time_optional; unavailable upstream members remain unset",
         "standard_fields_reused=id(1),index(2),key(3),value(4),attributes(6),num_segments_in_candidate(7)",
     ]
     for index, item in enumerate(result.serializers, start=1):

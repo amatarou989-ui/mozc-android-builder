@@ -68,6 +68,10 @@ class PatchMozcCandidateMetadataTest(unittest.TestCase):
             self.assertIn("futatsumugi_cost_before_rescoring = 211", proto)
             self.assertIn("set_futatsumugi_structure_cost", cpp)
             self.assertIn("add_futatsumugi_inner_segment_boundary", cpp)
+            self.assertIn(
+                "FutatsumugiSetCandidateMetadata(candidate_word_proto, segment_candidate);",
+                cpp,
+            )
 
     def test_patch_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -96,8 +100,9 @@ class PatchMozcCandidateMetadataTest(unittest.TestCase):
             self.assertEqual("word", result.serializer_proto_var)
             self.assertEqual("cand", result.serializer_candidate_var)
             patched = engine_cpp.read_text(encoding="utf-8")
-            self.assertIn("word->set_futatsumugi_lid(cand.lid);", patched)
-            self.assertIn("word->set_futatsumugi_structure_cost(cand.structure_cost);", patched)
+            self.assertIn("FutatsumugiSetCandidateMetadata(word, cand);", patched)
+            self.assertIn("FUTATSUMUGI_DEFINE_SCALAR_METADATA(lid", patched)
+            self.assertIn("structure_cost, set_futatsumugi_structure_cost", patched)
 
     def test_multiple_candidate_word_serializers_are_all_patched(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -113,9 +118,9 @@ class PatchMozcCandidateMetadataTest(unittest.TestCase):
             self.assertEqual(2, len(result.serializers))
             patched = engine_cpp.read_text(encoding="utf-8")
             self.assertEqual(2, patched.count("Futatsumugi ranking metadata"))
-            self.assertIn("word->set_futatsumugi_lid(cand.lid);", patched)
+            self.assertIn("FutatsumugiSetCandidateMetadata(word, cand);", patched)
             self.assertIn(
-                "candidate_word->set_futatsumugi_lid(candidate.lid);",
+                "FutatsumugiSetCandidateMetadata(candidate_word, candidate);",
                 patched,
             )
 
@@ -158,13 +163,40 @@ class PatchMozcCandidateMetadataTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 patch_mozc_source(src)
 
-    def test_missing_candidate_member_stops_instead_of_guessing(self):
+    def test_missing_candidate_member_is_left_unset_by_compile_time_detection(self):
         with tempfile.TemporaryDirectory() as temporary:
             src = self.make_tree(Path(temporary))
             candidate = src / "converter" / "candidate.h"
-            candidate.write_text(CANDIDATE.replace("  int structure_cost;\n", ""), encoding="utf-8")
-            with self.assertRaises(RuntimeError):
-                patch_mozc_source(src)
+            candidate.write_text(
+                CANDIDATE.replace("  int structure_cost;\n", "")
+                .replace("  int32_t cost_before_rescoring;\n", ""),
+                encoding="utf-8",
+            )
+
+            result = patch_mozc_source(src)
+
+            self.assertTrue(result.cpp_changed)
+            cpp = (src / "session" / "internal" / "session_output.cc").read_text(encoding="utf-8")
+            self.assertIn(
+                "structure_cost, set_futatsumugi_structure_cost", cpp
+            )
+            self.assertIn(
+                "cost_before_rescoring, set_futatsumugi_cost_before_rescoring", cpp
+            )
+            self.assertIn("FutatsumugiSetCandidateMetadata", cpp)
+
+    def test_candidate_definition_file_is_not_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            src = self.make_tree(Path(temporary))
+            (src / "converter" / "candidate.h").unlink()
+
+            result = patch_mozc_source(src)
+
+            self.assertTrue(result.cpp_changed)
+            self.assertEqual(
+                Path("compile-time-optional-member-detection"),
+                result.candidate_definition,
+            )
 
 
 if __name__ == "__main__":

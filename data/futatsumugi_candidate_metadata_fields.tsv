@@ -1,19 +1,19 @@
-field_number	proto_name	type	purpose
-1	id	int32	Mozc standard candidate id (already present)
-2	index	uint32	Mozc standard displayed rank index (already present)
-3	key	string	Mozc standard candidate key when emitted (already present)
-4	value	string	Mozc standard candidate value (already present)
-6	attributes	repeated enum	Public candidate attributes (already present)
-7	num_segments_in_candidate	int32	Number of inner segments (already present)
-200	futatsumugi_lid	int32	Left context/POS id
-201	futatsumugi_rid	int32	Right context/POS id
-202	futatsumugi_cost	int32	Overall candidate cost; lower is generally stronger
-203	futatsumugi_wcost	int32	Word/path cost component
-204	futatsumugi_structure_cost	int32	Internal transition/structure cost
-205	futatsumugi_content_key	string	Content-word reading before functional suffix
-206	futatsumugi_content_value	string	Content-word surface before functional suffix
-207	futatsumugi_raw_attributes	uint32	Raw Segment::Candidate attribute bit mask
-208	futatsumugi_source_info	uint32	Raw Segment::Candidate source_info bit mask
-209	futatsumugi_consumed_key_size	uint64	Consumed key size for partial/mobile candidates
-210	futatsumugi_inner_segment_boundary	repeated uint32	Encoded key/value/content byte lengths per inner segment
-211	futatsumugi_cost_before_rescoring	int32	Cost before Mozc rescoring, for diagnosing reranker effects
+field_number	proto_name	type	purpose	availability
+1	id	int32	Mozc standard candidate id (already present)	standard
+2	index	uint32	Mozc standard displayed rank index (already present)	standard
+3	key	string	Mozc standard candidate key when emitted (already present)	standard
+4	value	string	Mozc standard candidate value (already present)	standard
+6	attributes	repeated enum	Public candidate attributes (already present)	standard
+7	num_segments_in_candidate	int32	Number of inner segments (already present)	standard
+200	futatsumugi_lid	int32	Left context/POS id	optional-upstream-member
+201	futatsumugi_rid	int32	Right context/POS id	optional-upstream-member
+202	futatsumugi_cost	int32	Overall candidate cost; lower is generally stronger	optional-upstream-member
+203	futatsumugi_wcost	int32	Word/path cost component	optional-upstream-member
+204	futatsumugi_structure_cost	int32	Internal transition/structure cost	optional-upstream-member
+205	futatsumugi_content_key	string	Content-word reading before functional suffix	optional-upstream-member
+206	futatsumugi_content_value	string	Content-word surface before functional suffix	optional-upstream-member
+207	futatsumugi_raw_attributes	uint32	Raw Segment::Candidate attribute bit mask	optional-upstream-member
+208	futatsumugi_source_info	uint32	Raw Segment::Candidate source_info bit mask	optional-upstream-member
+209	futatsumugi_consumed_key_size	uint64	Consumed key size for partial/mobile candidates	optional-upstream-member
+210	futatsumugi_inner_segment_boundary	repeated uint32	Encoded key/value/content byte lengths per inner segment	optional-upstream-member
+211	futatsumugi_cost_before_rescoring	int32	Cost before Mozc rescoring, for diagnosing reranker effects	optional-upstream-member
